@@ -209,25 +209,152 @@ function formatModelDisplay(modelName: string): string {
   if (m === "gemini-3.8-flash") return "Gemini 3.8 Flash";
   if (m === "gemini-3.8-flash-lite") return "Gemini 3.8 Flash-Lite";
   if (m === "gemini-3.8-pro") return "Gemini 3.8 Pro";
-  if (m === "gemini-flash-latest") return "Gemini Flash Latest";
+  if (m === "gemini-3-flash") return "Gemini 3 Flash";
+  if (m === "gemini-3-pro") return "Gemini 3 Pro";
+  if (m === "gemini-2.5-pro") return "Gemini 2.5 Pro";
   return m;
 }
 
-function getFallbackModelList(initialModel: string): string[] {
-  const clean = initialModel.replace(/^models\//, "");
-  const list = [clean];
-  const activeModels = [
-    "gemini-3.8-flash",
-    "gemini-3.8-flash-lite",
-    "gemini-3.8-pro",
-    "gemini-flash-latest",
-  ];
-  for (const m of activeModels) {
-    if (!list.includes(m)) {
-      list.push(m);
+// Auto-discover available models supported by the API key on v1beta
+async function fetchAvailableModels(apiKey: string): Promise<string[]> {
+  const modelsSet = new Set<string>();
+
+  // 1. Direct v1beta ListModels endpoint
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.models)) {
+        for (const item of data.models) {
+          const rawName: string = item.name || "";
+          const cleanName = rawName.replace(/^models\//, "").trim();
+          const methods: string[] =
+            item.supportedGenerationMethods || item.supportedActions || [];
+          const supportsGenerate =
+            methods.includes("generateContent") || methods.length === 0;
+
+          const lower = cleanName.toLowerCase();
+          const isExcluded =
+            lower.includes("embedding") ||
+            lower.includes("imagen") ||
+            lower.includes("veo") ||
+            lower.includes("tts") ||
+            lower.includes("aqa") ||
+            lower.includes("robotics");
+
+          if (cleanName && supportsGenerate && !isExcluded) {
+            modelsSet.add(cleanName);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Direct v1beta ListModels fetch notice:", err);
+  }
+
+  // 2. SDK ai.models.list() fallback
+  if (modelsSet.size === 0) {
+    try {
+      const ai = new GoogleGenAI({
+        apiKey,
+        apiVersion: "v1beta",
+        httpOptions: { apiVersion: "v1beta" },
+      });
+      const pager = await ai.models.list();
+      for await (const m of pager) {
+        const cleanName = (m.name || "").replace(/^models\//, "").trim();
+        const methods: string[] =
+          (m as any).supportedGenerationMethods ||
+          (m as any).supportedActions ||
+          [];
+        const supportsGenerate =
+          methods.includes("generateContent") || methods.length === 0;
+
+        const lower = cleanName.toLowerCase();
+        const isExcluded =
+          lower.includes("embedding") ||
+          lower.includes("imagen") ||
+          lower.includes("veo") ||
+          lower.includes("tts") ||
+          lower.includes("aqa") ||
+          lower.includes("robotics");
+
+        if (cleanName && supportsGenerate && !isExcluded) {
+          modelsSet.add(cleanName);
+        }
+      }
+    } catch (err) {
+      console.warn("SDK ai.models.list() fallback notice:", err);
     }
   }
-  return list;
+
+  return Array.from(modelsSet);
+}
+
+// Build the prioritized fallback chain dynamically from models actually returned by the API key
+function buildDynamicFallbackList(
+  selectedModel: string,
+  liveAvailableModels: string[]
+): string[] {
+  const cleanSelected = selectedModel.replace(/^models\//, "").trim();
+  const result: string[] = [];
+
+  const addModel = (m: string) => {
+    const clean = m.replace(/^models\//, "").trim();
+    if (clean && !result.includes(clean)) {
+      result.push(clean);
+    }
+  };
+
+  // 1. First, user's selected model
+  addModel(cleanSelected);
+
+  if (liveAvailableModels.length > 0) {
+    // 2. Next, any live available models matching priority candidate patterns
+    const priorityTargets = [
+      "gemini-3.8-flash",
+      "gemini-3.8-flash-lite",
+      "gemini-3.8-pro",
+      "gemini-3-flash",
+      "gemini-3-pro",
+      "gemini-2.5-pro",
+    ];
+
+    for (const target of priorityTargets) {
+      if (liveAvailableModels.includes(target)) {
+        addModel(target);
+      }
+    }
+
+    // 3. Next, any remaining flash models in liveAvailableModels
+    for (const m of liveAvailableModels) {
+      if (m.toLowerCase().includes("flash")) {
+        addModel(m);
+      }
+    }
+
+    // 4. Next, any remaining pro or general gemini models in liveAvailableModels
+    for (const m of liveAvailableModels) {
+      if (m.toLowerCase().startsWith("gemini-")) {
+        addModel(m);
+      }
+    }
+  } else {
+    // Safe defaults if live discovery returned empty
+    const defaults = [
+      "gemini-3.8-flash",
+      "gemini-3.8-flash-lite",
+      "gemini-3.8-pro",
+      "gemini-2.5-pro",
+    ];
+    for (const d of defaults) {
+      addModel(d);
+    }
+  }
+
+  return result;
 }
 
 function parseGeminiError(err: unknown): {
@@ -294,16 +421,17 @@ function parseGeminiError(err: unknown): {
   return { code, reason, isTransient, isNotFound };
 }
 
-// Execute Gemini call per batch with exponential backoff (2s, 4s, 8s) on 503/429/500 and fallback models
+// Execute Gemini call per batch with exponential backoff (2s, 4s, 8s) on 503/429/500 and dynamically discovered fallback models
 async function callGeminiBatchWithTimeoutAndRetry(
   ai: GoogleGenAI,
   modelName: string,
   parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }>,
   batchLabel: string,
   parentSignal: AbortSignal,
-  onStatusUpdate?: (status: string) => void
+  onStatusUpdate?: (status: string) => void,
+  liveAvailableModels: string[] = []
 ): Promise<string> {
-  const modelCandidates = getFallbackModelList(modelName);
+  const modelCandidates = buildDynamicFallbackList(modelName, liveAvailableModels);
   const backoffDelays = [2, 4, 8]; // Wait 2s, then 4s, then 8s
   const MAX_RETRIES = 3;
 
@@ -451,6 +579,54 @@ function PdfImportContent() {
     return process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
   });
   const [model, setModel] = useState("gemini-3.8-flash");
+
+  // Available Models State (Auto-discovered via v1beta ListModels)
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [isDiscoveringModels, setIsDiscoveringModels] = useState(false);
+
+  // Auto-discover live models supported by the API key on v1beta
+  useEffect(() => {
+    const effectiveKey = (
+      apiKey.trim() ||
+      process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
+      ""
+    ).trim();
+    if (!effectiveKey) return;
+
+    let cancelled = false;
+    setIsDiscoveringModels(true);
+
+    fetchAvailableModels(effectiveKey)
+      .then((discovered) => {
+        if (!cancelled && discovered.length > 0) {
+          setAvailableModels(discovered);
+          // If current model is not among discovered models, select the highest priority discovered model
+          setModel((current) => {
+            if (discovered.includes(current)) return current;
+            const preferred = [
+              "gemini-3.8-flash",
+              "gemini-3.8-flash-lite",
+              "gemini-3.8-pro",
+              "gemini-3-flash",
+              "gemini-3-pro",
+              "gemini-2.5-pro",
+            ];
+            for (const pref of preferred) {
+              if (discovered.includes(pref)) return pref;
+            }
+            return discovered[0] || current;
+          });
+        }
+      })
+      .catch((err) => console.warn("Model discovery notice:", err))
+      .finally(() => {
+        if (!cancelled) setIsDiscoveringModels(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apiKey]);
 
   // Drag states
   const [isQDragOver, setIsQDragOver] = useState(false);
@@ -715,9 +891,24 @@ function PdfImportContent() {
         }
       }
 
-      // 4. Initialize Gemini AI Client directly in browser
+      // 4. Initialize Gemini AI Client directly in browser with apiVersion: v1beta
+      const ai = new GoogleGenAI({
+        apiKey: effectiveApiKey,
+        apiVersion: "v1beta",
+        httpOptions: { apiVersion: "v1beta" },
+      });
+
+      // Auto-discover live models if not already loaded
+      let liveModels = availableModels;
+      if (liveModels.length === 0) {
+        setParseStatus("Auto-discovering active Gemini models on v1beta...");
+        liveModels = await fetchAvailableModels(effectiveApiKey);
+        if (liveModels.length > 0) {
+          setAvailableModels(liveModels);
+        }
+      }
+
       const chosenModel = (model || "gemini-3.8-flash").replace(/^models\//, "");
-      const ai = new GoogleGenAI({ apiKey: effectiveApiKey });
 
       // 5. Batch processing loop (2 pages per batch for 5-10s turnaround)
       const BATCH_SIZE = 2;
@@ -840,7 +1031,8 @@ ${batchPromptTemplate}`,
           parts,
           `${startPage}-${endPage}`,
           controller.signal,
-          (statusMsg) => setParseStatus(statusMsg)
+          (statusMsg) => setParseStatus(statusMsg),
+          liveModels
         );
 
         // Parse with safeParseJson to repair LaTeX escapes
@@ -1452,8 +1644,18 @@ ${batchPromptTemplate}`,
             </div>
 
             <div>
-              <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                Extraction Model
+              <label className="block text-[11px] font-semibold text-slate-300 mb-1 flex items-center justify-between">
+                <span>Extraction Model</span>
+                {isDiscoveringModels && (
+                  <span className="text-[10px] text-purple-400 font-normal animate-pulse">
+                    Auto-discovering models...
+                  </span>
+                )}
+                {!isDiscoveringModels && availableModels.length > 0 && (
+                  <span className="text-[10px] text-emerald-400 font-normal">
+                    {availableModels.length} models verified
+                  </span>
+                )}
               </label>
               <div className="relative">
                 <select
@@ -1461,18 +1663,38 @@ ${batchPromptTemplate}`,
                   onChange={(e) => setModel(e.target.value)}
                   className="w-full pl-3 pr-8 py-2 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs focus:outline-none focus:border-purple-500 appearance-none cursor-pointer transition"
                 >
-                  <option value="gemini-3.8-flash">
-                    gemini-3.8-flash (Recommended • Vision + Auto-Cropping)
-                  </option>
-                  <option value="gemini-3.8-flash-lite">
-                    gemini-3.8-flash-lite (Ultra Fast • High Rate Limits)
-                  </option>
-                  <option value="gemini-3.8-pro">
-                    gemini-3.8-pro (Maximum Reasoning & Complex Figures)
-                  </option>
-                  <option value="gemini-flash-latest">
-                    gemini-flash-latest (General Fast)
-                  </option>
+                  {availableModels.length > 0 ? (
+                    availableModels.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                        {m === "gemini-3.8-flash"
+                          ? " (Recommended • Vision + Auto-Cropping)"
+                          : m === "gemini-3.8-flash-lite"
+                          ? " (Ultra Fast • High Rate Limits)"
+                          : m === "gemini-3.8-pro"
+                          ? " (Maximum Reasoning & Complex Figures)"
+                          : m === "gemini-3-flash"
+                          ? " (Fast Vision)"
+                          : m === "gemini-3-pro"
+                          ? " (High Reasoning)"
+                          : m === "gemini-2.5-pro"
+                          ? " (Pro Reasoning)"
+                          : ""}
+                      </option>
+                    ))
+                  ) : (
+                    <>
+                      <option value="gemini-3.8-flash">
+                        gemini-3.8-flash (Recommended • Vision + Auto-Cropping)
+                      </option>
+                      <option value="gemini-3.8-flash-lite">
+                        gemini-3.8-flash-lite (Ultra Fast • High Rate Limits)
+                      </option>
+                      <option value="gemini-3.8-pro">
+                        gemini-3.8-pro (Maximum Reasoning & Complex Figures)
+                      </option>
+                    </>
+                  )}
                 </select>
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               </div>

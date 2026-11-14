@@ -213,8 +213,12 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
 
     parts.push({ text: systemPrompt });
 
-    // 6. Initialize GoogleGenAI and generateContentStream
-    const ai = new GoogleGenAI({ apiKey });
+    // 6. Initialize GoogleGenAI with v1beta and generateContentStream
+    const ai = new GoogleGenAI({
+      apiKey,
+      apiVersion: "v1beta",
+      httpOptions: { apiVersion: "v1beta" },
+    });
     const selectedModel =
       (clientModel?.trim() || "gemini-3.8-flash").replace(/^models\//, "") ||
       "gemini-3.8-flash";
