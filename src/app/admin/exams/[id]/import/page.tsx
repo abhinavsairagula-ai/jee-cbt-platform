@@ -95,7 +95,7 @@ function PdfImportContent() {
     }
     return "";
   });
-  const [model, setModel] = useState("gemini-2.5-flash");
+  const [model, setModel] = useState("gemini-3.8-flash");
 
   // Drag states
   const [isQDragOver, setIsQDragOver] = useState(false);
@@ -284,6 +284,7 @@ function PdfImportContent() {
           questionPdfUrl,
           solutionPdfUrl,
           apiKey: apiKey.trim() || undefined,
+          model: model || "gemini-3.8-flash",
         }),
         signal: controller.signal,
       });
@@ -883,8 +884,8 @@ function PdfImportContent() {
                   onChange={(e) => setModel(e.target.value)}
                   className="w-full pl-3 pr-8 py-2 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs focus:outline-none focus:border-purple-500 appearance-none cursor-pointer transition"
                 >
-                  <option value="gemini-2.5-flash">
-                    gemini-2.5-flash (Recommended • Streaming Fast)
+                  <option value="gemini-3.8-flash">
+                    gemini-3.8-flash (Recommended • Streaming Fast)
                   </option>
                   <option value="gemini-flash-latest">
                     gemini-flash-latest (General Fast)
@@ -894,9 +895,6 @@ function PdfImportContent() {
                   </option>
                   <option value="gemini-3.5-flash">
                     gemini-3.5-flash (Gemini 3.5 Flash)
-                  </option>
-                  <option value="gemini-3.8-flash">
-                    gemini-3.8-flash (Gemini 3.8 Flash)
                   </option>
                 </select>
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -965,7 +963,7 @@ function PdfImportContent() {
               ({questionPdf ? (questionPdf.size / (1024 * 1024)).toFixed(2) : 0} MB)
             </span>
             <span className="text-cyan-400/80 font-medium">
-              Direct Supabase Upload • Gemini 2.5 Flash Streaming
+              Direct Supabase Upload • Gemini 3.8 Flash Streaming
             </span>
           </div>
         </div>

@@ -78,6 +78,7 @@ export async function POST(
       questionPdfUrl?: string;
       solutionPdfUrl?: string | null;
       apiKey?: string | null;
+      model?: string | null;
     };
     try {
       body = await req.json();
@@ -91,7 +92,12 @@ export async function POST(
       );
     }
 
-    const { questionPdfUrl, solutionPdfUrl, apiKey: clientApiKey } = body;
+    const {
+      questionPdfUrl,
+      solutionPdfUrl,
+      apiKey: clientApiKey,
+      model: clientModel,
+    } = body;
 
     if (!questionPdfUrl) {
       return NextResponse.json(
@@ -209,9 +215,12 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
 
     // 6. Initialize GoogleGenAI and generateContentStream
     const ai = new GoogleGenAI({ apiKey });
+    const selectedModel =
+      (clientModel?.trim() || "gemini-3.8-flash").replace(/^models\//, "") ||
+      "gemini-3.8-flash";
 
     const responseStream = await ai.models.generateContentStream({
-      model: "gemini-2.5-flash",
+      model: selectedModel,
       contents: parts,
       config: {
         responseMimeType: "application/json",
