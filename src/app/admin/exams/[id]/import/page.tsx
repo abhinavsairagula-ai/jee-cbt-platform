@@ -209,7 +209,6 @@ function formatModelDisplay(modelName: string): string {
   if (m === "gemini-3.8-flash") return "Gemini 3.8 Flash";
   if (m === "gemini-3.8-flash-lite") return "Gemini 3.8 Flash-Lite";
   if (m === "gemini-3.8-pro") return "Gemini 3.8 Pro";
-  if (m === "gemini-2.5-flash") return "Gemini 2.5 Flash";
   if (m === "gemini-flash-latest") return "Gemini Flash Latest";
   return m;
 }
@@ -217,14 +216,15 @@ function formatModelDisplay(modelName: string): string {
 function getFallbackModelList(initialModel: string): string[] {
   const clean = initialModel.replace(/^models\//, "");
   const list = [clean];
-  const preferredFallbacks = [
+  const activeModels = [
     "gemini-3.8-flash",
     "gemini-3.8-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-3.8-pro",
+    "gemini-flash-latest",
   ];
-  for (const fb of preferredFallbacks) {
-    if (!list.includes(fb)) {
-      list.push(fb);
+  for (const m of activeModels) {
+    if (!list.includes(m)) {
+      list.push(m);
     }
   }
   return list;
@@ -333,8 +333,12 @@ async function callGeminiBatchWithTimeoutAndRetry(
           abortSignal: controller.signal,
         };
 
-        // For non-pro models, disable extended thinking for sub-second latency
-        if (!currentModel.includes("pro")) {
+        // Ensure thinkingBudget: 0 is explicitly passed for gemini-3.8-flash and gemini-3.8-flash-lite (omitting on gemini-3.8-pro)
+        if (
+          currentModel === "gemini-3.8-flash" ||
+          currentModel === "gemini-3.8-flash-lite" ||
+          (currentModel.includes("flash") && !currentModel.includes("pro"))
+        ) {
           config.thinkingConfig = { thinkingBudget: 0 };
         }
 
@@ -684,6 +688,33 @@ function PdfImportContent() {
         pageJpegs.push(base64);
       }
 
+      // Render Solution / Answer Key PDF pages if uploaded
+      const solutionPageJpegs: string[] = [];
+      if (solutionPdf) {
+        setParseStatus("Rendering Solution / Answer Key PDF pages to high-res canvas...");
+        try {
+          const sArrayBuffer = await solutionPdf.arrayBuffer();
+          const sPdfDoc = await pdfjsLib.getDocument({ data: sArrayBuffer }).promise;
+          const sNumPages = sPdfDoc.numPages;
+
+          for (let sp = 1; sp <= sNumPages; sp++) {
+            if (controller.signal.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+            const sPage = await sPdfDoc.getPage(sp);
+            const sViewport = sPage.getViewport({ scale: 2.0 });
+            const sCanvas = document.createElement("canvas");
+            sCanvas.width = Math.floor(sViewport.width);
+            sCanvas.height = Math.floor(sViewport.height);
+            const sCtx = sCanvas.getContext("2d");
+            if (sCtx) {
+              await sPage.render({ canvasContext: sCtx, viewport: sViewport, canvas: sCanvas }).promise;
+              solutionPageJpegs.push(sCanvas.toDataURL("image/jpeg", 0.85).split(",")[1]);
+            }
+          }
+        } catch (sErr) {
+          console.warn("Failed to render solution PDF pages:", sErr);
+        }
+      }
+
       // 4. Initialize Gemini AI Client directly in browser
       const chosenModel = (model || "gemini-3.8-flash").replace(/^models\//, "");
       const ai = new GoogleGenAI({ apiKey: effectiveApiKey });
@@ -695,7 +726,7 @@ function PdfImportContent() {
       let totalQuestionsFound = 0;
 
       const solutionNote = solutionPdf
-        ? "If a question corresponds to standard JEE syllabus questions, solve it with complete accuracy, determine the correct answer, and provide a clear, step-by-step mathematical/conceptual solution."
+        ? "DOCUMENT 2 (attached images) contains the OFFICIAL SOLUTION & ANSWER KEY. Match each extracted question with its corresponding official answer key and step-by-step derivation from DOCUMENT 2."
         : "Solve each question with complete accuracy, determine the correct answer, and provide a clear, step-by-step mathematical/conceptual solution.";
 
       const batchPromptTemplate = `You are an expert NTA JEE (Main) Question Paper Digitizer, KaTeX formatter, and diagram extractor.
@@ -773,6 +804,26 @@ JSON SCHEMA TO RETURN:
               data: pageJpegs[pgNum - 1],
             },
           });
+        }
+
+        // Attach Solution Paper images if uploaded
+        if (solutionPageJpegs.length > 0) {
+          parts.push({
+            text: "--- DOCUMENT 2: OFFICIAL SOLUTION & ANSWER KEY PAPER PAGES ---",
+          });
+          const sPages =
+            solutionPageJpegs.length <= 4
+              ? solutionPageJpegs
+              : solutionPageJpegs.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
+
+          for (let si = 0; si < sPages.length; si++) {
+            parts.push({
+              inlineData: {
+                mimeType: "image/jpeg",
+                data: sPages[si],
+              },
+            });
+          }
         }
 
         parts.push({
@@ -1418,9 +1469,6 @@ ${batchPromptTemplate}`,
                   </option>
                   <option value="gemini-3.8-pro">
                     gemini-3.8-pro (Maximum Reasoning & Complex Figures)
-                  </option>
-                  <option value="gemini-2.5-flash">
-                    gemini-2.5-flash (Reliable Fallback)
                   </option>
                   <option value="gemini-flash-latest">
                     gemini-flash-latest (General Fast)
