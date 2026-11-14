@@ -204,82 +204,212 @@ async function uploadDiagramBlob(
   return null;
 }
 
-// Execute Gemini call per batch with strict 45-second timeout and 1 retry
+function formatModelDisplay(modelName: string): string {
+  const m = modelName.replace(/^models\//, "");
+  if (m === "gemini-3.8-flash") return "Gemini 3.8 Flash";
+  if (m === "gemini-3.8-flash-lite") return "Gemini 3.8 Flash-Lite";
+  if (m === "gemini-3.8-pro") return "Gemini 3.8 Pro";
+  if (m === "gemini-2.5-flash") return "Gemini 2.5 Flash";
+  if (m === "gemini-flash-latest") return "Gemini Flash Latest";
+  return m;
+}
+
+function getFallbackModelList(initialModel: string): string[] {
+  const clean = initialModel.replace(/^models\//, "");
+  const list = [clean];
+  const preferredFallbacks = [
+    "gemini-3.8-flash",
+    "gemini-3.8-flash-lite",
+    "gemini-2.5-flash",
+  ];
+  for (const fb of preferredFallbacks) {
+    if (!list.includes(fb)) {
+      list.push(fb);
+    }
+  }
+  return list;
+}
+
+function parseGeminiError(err: unknown): {
+  code: number;
+  reason: string;
+  isTransient: boolean;
+  isNotFound: boolean;
+} {
+  if (!err) {
+    return { code: 0, reason: "Unknown error", isTransient: false, isNotFound: false };
+  }
+
+  let status = (err as { status?: number })?.status || 0;
+  const msg = err instanceof Error ? err.message : String(err);
+
+  try {
+    const parsed = JSON.parse(msg);
+    if (parsed.error?.code) {
+      status = Number(parsed.error.code) || status;
+    }
+  } catch {}
+
+  const lower = msg.toLowerCase();
+  const is503 =
+    status === 503 ||
+    msg.includes("503") ||
+    lower.includes("unavailable") ||
+    lower.includes("high demand") ||
+    lower.includes("overloaded");
+
+  const is429 =
+    status === 429 ||
+    msg.includes("429") ||
+    lower.includes("resource exhausted") ||
+    lower.includes("quota") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests");
+
+  const is500 =
+    status === 500 ||
+    msg.includes("500") ||
+    lower.includes("internal error");
+
+  const isTimeout =
+    lower.includes("timeout") ||
+    lower.includes("deadline") ||
+    (err instanceof DOMException && err.name === "AbortError");
+
+  const isNotFound =
+    status === 404 ||
+    msg.includes("404") ||
+    lower.includes("not found");
+
+  const code = is503 ? 503 : is429 ? 429 : is500 ? 500 : isNotFound ? 404 : status;
+
+  let reason = `error (${code || "unknown"})`;
+  if (is503) reason = "busy (503)";
+  else if (is429) reason = "rate-limited (429)";
+  else if (is500) reason = "server error (500)";
+  else if (isTimeout) reason = "timed out (45s)";
+  else if (isNotFound) reason = "not found (404)";
+
+  const isTransient = is503 || is429 || is500 || isTimeout;
+  return { code, reason, isTransient, isNotFound };
+}
+
+// Execute Gemini call per batch with exponential backoff (2s, 4s, 8s) on 503/429/500 and fallback models
 async function callGeminiBatchWithTimeoutAndRetry(
   ai: GoogleGenAI,
   modelName: string,
   parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }>,
   batchLabel: string,
-  parentSignal: AbortSignal
+  parentSignal: AbortSignal,
+  onStatusUpdate?: (status: string) => void
 ): Promise<string> {
-  const MAX_RETRIES = 1;
-  let attempt = 0;
-  let currentModel = modelName;
+  const modelCandidates = getFallbackModelList(modelName);
+  const backoffDelays = [2, 4, 8]; // Wait 2s, then 4s, then 8s
+  const MAX_RETRIES = 3;
 
-  while (attempt <= MAX_RETRIES) {
-    attempt++;
-    const controller = new AbortController();
+  let lastError: unknown = null;
 
-    const onParentAbort = () => controller.abort();
-    parentSignal.addEventListener("abort", onParentAbort);
+  for (let mIdx = 0; mIdx < modelCandidates.length; mIdx++) {
+    const currentModel = modelCandidates[mIdx];
+    const isLastModel = mIdx === modelCandidates.length - 1;
 
-    // 45s strict timeout per batch
-    const timeoutId = setTimeout(() => {
-      controller.abort();
-    }, 45000);
-
-    try {
-      const responseStream = await ai.models.generateContentStream({
-        model: currentModel,
-        contents: parts as any,
-        config: {
-          responseMimeType: "application/json",
-          thinkingConfig: {
-            thinkingBudget: 0,
-          },
-          abortSignal: controller.signal,
-        },
-      });
-
-      let fullText = "";
-      for await (const chunk of responseStream) {
-        if (parentSignal.aborted) {
-          throw new DOMException("Extraction was cancelled by user.", "AbortError");
-        }
-        if (chunk.text) {
-          fullText += chunk.text;
-        }
-      }
-
-      clearTimeout(timeoutId);
-      parentSignal.removeEventListener("abort", onParentAbort);
-      return fullText;
-    } catch (err: unknown) {
-      clearTimeout(timeoutId);
-      parentSignal.removeEventListener("abort", onParentAbort);
-
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (parentSignal.aborted) {
         throw new DOMException("Extraction was cancelled by user.", "AbortError");
       }
 
-      console.warn(`[Batch ${batchLabel}] Attempt ${attempt} failed:`, err);
+      const controller = new AbortController();
+      const onParentAbort = () => controller.abort();
+      parentSignal.addEventListener("abort", onParentAbort);
 
-      // If model not found (404), fall back to gemini-2.5-flash
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errMsg.includes("404") || errMsg.includes("not found")) {
-        currentModel = "gemini-2.5-flash";
+      // 45s strict timeout per batch
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+      }, 45000);
+
+      try {
+        const config: Record<string, any> = {
+          responseMimeType: "application/json",
+          abortSignal: controller.signal,
+        };
+
+        // For non-pro models, disable extended thinking for sub-second latency
+        if (!currentModel.includes("pro")) {
+          config.thinkingConfig = { thinkingBudget: 0 };
+        }
+
+        const responseStream = await ai.models.generateContentStream({
+          model: currentModel,
+          contents: parts as any,
+          config,
+        });
+
+        let fullText = "";
+        for await (const chunk of responseStream) {
+          if (parentSignal.aborted) {
+            throw new DOMException("Extraction was cancelled by user.", "AbortError");
+          }
+          if (chunk.text) {
+            fullText += chunk.text;
+          }
+        }
+
+        clearTimeout(timeoutId);
+        parentSignal.removeEventListener("abort", onParentAbort);
+        return fullText;
+      } catch (err: unknown) {
+        clearTimeout(timeoutId);
+        parentSignal.removeEventListener("abort", onParentAbort);
+
+        if (parentSignal.aborted) {
+          throw new DOMException("Extraction was cancelled by user.", "AbortError");
+        }
+
+        lastError = err;
+        const errInfo = parseGeminiError(err);
+        console.warn(
+          `[Batch ${batchLabel}] ${currentModel} attempt ${attempt + 1}/${MAX_RETRIES + 1} failed:`,
+          err
+        );
+
+        // If model not found (404), immediately fall back to next model without burning retries
+        if (errInfo.isNotFound && !isLastModel) {
+          const nextModel = modelCandidates[mIdx + 1];
+          onStatusUpdate?.(
+            `${formatModelDisplay(currentModel)} not found (404) — falling back to ${formatModelDisplay(nextModel)}...`
+          );
+          await new Promise((r) => setTimeout(r, 1000));
+          break; // Break inner loop to try next model in candidate list
+        }
+
+        // Retry with exponential backoff if retries remain
+        if (attempt < MAX_RETRIES) {
+          const waitSec = backoffDelays[attempt] || 8;
+          for (let rem = waitSec; rem > 0; rem--) {
+            if (parentSignal.aborted) {
+              throw new DOMException("Extraction was cancelled by user.", "AbortError");
+            }
+            onStatusUpdate?.(
+              `${formatModelDisplay(currentModel)} ${errInfo.reason} — retrying automatically in ${rem}s...`
+            );
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+        } else {
+          // All retries exhausted on this model. Fall back to next model if available
+          if (!isLastModel) {
+            const nextModel = modelCandidates[mIdx + 1];
+            onStatusUpdate?.(
+              `${formatModelDisplay(currentModel)} high demand/error (${errInfo.code || 503}) after ${MAX_RETRIES} retries — falling back to ${formatModelDisplay(nextModel)}...`
+            );
+            await new Promise((r) => setTimeout(r, 1500));
+            break; // Break to switch model
+          }
+        }
       }
-
-      if (attempt > MAX_RETRIES) {
-        throw err;
-      }
-
-      // Small backoff before retry
-      await new Promise((r) => setTimeout(r, 1200));
     }
   }
 
-  throw new Error(`Failed to extract batch ${batchLabel} after retry.`);
+  throw lastError || new Error(`Failed to extract batch ${batchLabel} across all models and retries.`);
 }
 
 function PdfImportContent() {
@@ -652,13 +782,14 @@ JSON SCHEMA TO RETURN:
 ${batchPromptTemplate}`,
         });
 
-        // Call Gemini with 45s timeout and 1 automatic retry
+        // Call Gemini with 45s timeout, 3 retries, exponential backoff, and model fallback
         const batchJsonText = await callGeminiBatchWithTimeoutAndRetry(
           ai,
           chosenModel,
           parts,
           `${startPage}-${endPage}`,
-          controller.signal
+          controller.signal,
+          (statusMsg) => setParseStatus(statusMsg)
         );
 
         // Parse with safeParseJson to repair LaTeX escapes
@@ -1281,6 +1412,12 @@ ${batchPromptTemplate}`,
                 >
                   <option value="gemini-3.8-flash">
                     gemini-3.8-flash (Recommended • Vision + Auto-Cropping)
+                  </option>
+                  <option value="gemini-3.8-flash-lite">
+                    gemini-3.8-flash-lite (Ultra Fast • High Rate Limits)
+                  </option>
+                  <option value="gemini-3.8-pro">
+                    gemini-3.8-pro (Maximum Reasoning & Complex Figures)
                   </option>
                   <option value="gemini-2.5-flash">
                     gemini-2.5-flash (Reliable Fallback)
