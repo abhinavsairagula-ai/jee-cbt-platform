@@ -179,6 +179,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
    - Every single variable, equation, scientific notation, unit, chemical formula, or mathematical symbol MUST be formatted in standard KaTeX.
    - Use '$...$' for inline math (e.g. '$x^2 + y^2 = r^2$', '$\\frac{hc}{\\lambda}$', '$\\text{KMnO}_4$').
    - Use '$$...$$' for standalone or display equations.
+   - STRICT RULE: NEVER wrap English sentences, options, or explanations in '$...$' or '$$...$$'. Only wrap actual mathematical formulas, variables (e.g. $x$, $\theta$), numbers with exponents, or chemical equations in math delimiters. Normal English text MUST be written bare without '$'.
    - In JSON, ALWAYS write double backslashes for all LaTeX commands: use '\\\\frac', '\\\\int', '\\\\theta', '\\\\alpha', '\\\\sin', '\\\\vec', '\\\\sqrt', '\\\\cos', '\\\\text', '\\\\sum', etc. Never write a single backslash.
    - Format chemical species and reactions properly (e.g., '$\\text{H}_2\\text{SO}_4$', '$\\text{Zn} + 2\\text{HCl} \\rightarrow \\text{ZnCl}_2 + \\text{H}_2$').
 

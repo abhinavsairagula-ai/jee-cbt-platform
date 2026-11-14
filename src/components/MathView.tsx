@@ -100,24 +100,113 @@ export function parseMarkdownTables(text: string): ContentSegment[] {
   return segments;
 }
 
+function isCommonEnglishWord(word: string): boolean {
+  const common = new Set([
+    "a", "an", "the", "in", "on", "at", "by", "for", "with", "about", "against",
+    "between", "into", "through", "during", "before", "after", "above", "below",
+    "to", "from", "up", "down", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "shall", "will", "should", "would",
+    "may", "might", "must", "can", "could", "and", "but", "or", "nor", "so",
+    "yet", "either", "neither", "both", "not", "only", "where", "which", "when",
+    "what", "that", "this", "these", "those", "then", "than", "there", "here",
+    "all", "any", "some", "none", "one", "two", "each", "every", "other", "such",
+    "if", "as", "of", "off", "out", "over", "under", "again", "further", "once",
+    "statement", "statements", "assertion", "reason", "option", "options",
+    "process", "expansion", "compression", "work", "heat", "done", "given",
+    "below", "above", "correct", "incorrect", "true", "false", "value", "order",
+    "size", "ions", "mass", "gas", "moles", "ideal", "constant", "describes",
+    "which", "match", "list", "following", "column", "type", "condition", "reaction",
+    "product", "reactants", "equilibrium", "temperature", "pressure", "volume",
+    "increases", "decreases", "remains", "same", "zero", "positive", "negative",
+    "hybridisation", "geometry", "structure", "structures", "diagram", "figure"
+  ]);
+  return common.has(word.toLowerCase().replace(/[.,:;?!()]/g, ""));
+}
+
+function isMathPiece(str: string): boolean {
+  if (!str) return false;
+  // Has LaTeX command like \Delta, \frac, \ln, \alpha, \sqrt
+  if (/\\[a-zA-Z]+/.test(str)) return true;
+  // Has sub/superscript like x^2, P^{3-}, H_2O, R_1, Cr_2O_7^{2-}
+  if (/[\^_]/.test(str)) return true;
+  // Fraction like R/2, 1/2, a/b, 3/4
+  if (/^[A-Za-z0-9]+\/[A-Za-z0-9]+$/.test(str)) return true;
+  // Math operators: =, >, <, +, -, *, /, \le, \ge, \pm, \approx
+  if (/^[=><\+\-\*\/]+$/.test(str)) return true;
+  // Numbers / scientific notation (e.g. 10, 3.14, -5)
+  if (/^[+\-]?[0-9]+(?:\.[0-9]+)?$/.test(str)) return true;
+  // Single-letter math variables: x, y, z, w, k, R, T, V, P, U, q, n (excluding English "a", "i")
+  if (/^[a-zA-Z]$/.test(str) && !["a", "i", "A", "I"].includes(str)) return true;
+  // Chemical formulas or short compound variables like nRT, hc, Cl-, Na+
+  if (/^[+\-]?[a-zA-Z0-9]{1,4}[+\-]?$/.test(str) && !isCommonEnglishWord(str)) return true;
+
+  return false;
+}
+
 /**
- * Re-wraps true mathematical and chemical expressions (e.g. R, R/2, x^2, \theta, \frac{a}{b})
+ * Re-wraps true mathematical and chemical expressions (e.g. R, R/2, x^2, \theta, \frac{a}{b}, P^{3-})
  * with $...$ inside a text string that was previously erroneously wrapped as a giant math block.
  */
 function rewrapMathTokens(prose: string): string {
-  // Matches LaTeX commands (\frac, \theta), variable subscripts/superscripts (x^2, R_1, 10^{-4}),
-  // ratios (R/2, \sqrt{2}/2), or simple equations (k = R/\sqrt{2})
-  const mathTokenPattern = /(?:(?:[a-zA-Z0-9\(\)]*\s*)?\\[a-zA-Z]+(?:\{[^{}]*\}|\[[^[\]]*\])*(?:[\^_][a-zA-Z0-9{}]+|\/[0-9a-zA-Z]+|\s*[\+\-\=\*\/]\s*[a-zA-Z0-9\\]+)*|[a-zA-Z0-9]+[\^_][a-zA-Z0-9{}]+|[A-Z]\/[0-9]+|[a-zA-Z]\s*=\s*[0-9a-zA-Z\/\+\-\*\^_{}\\]+)/g;
+  const tokens = prose.split(/(\s+)/);
+  const result: string[] = [];
+  let currentMathGroup: string[] = [];
 
-  return prose.replace(mathTokenPattern, (match) => {
-    const trimmed = match.trim();
-    if (!trimmed) return match;
-    // Don't re-wrap if already wrapped in $
-    if (trimmed.startsWith("$") && trimmed.endsWith("$")) return trimmed;
-    // If it's a plain word (e.g. "and", "the", "Statement"), don't wrap
-    if (/^[A-Za-z]{2,}$/.test(trimmed)) return match;
-    return `$${trimmed}$`;
-  });
+  const flushMathGroup = () => {
+    if (currentMathGroup.length === 0) return;
+
+    const text = currentMathGroup.join("");
+    const leadingWsMatch = text.match(/^\s+/);
+    const trailingWsMatch = text.match(/\s+$/);
+    const leadingWs = leadingWsMatch ? leadingWsMatch[0] : "";
+    const trailingWs = trailingWsMatch ? trailingWsMatch[0] : "";
+    const trimmed = text.trim();
+
+    // Only re-wrap if the group contains genuine math features
+    const hasRealMath =
+      /\\[a-zA-Z]+/.test(trimmed) ||
+      /[\^_]/.test(trimmed) ||
+      /[A-Za-z0-9]+\/[A-Za-z0-9]+/.test(trimmed) ||
+      /[=><]/.test(trimmed) ||
+      /[+\-][0-9]/.test(trimmed) ||
+      /^[xyzktRTVPUqn]$/.test(trimmed);
+
+    if (hasRealMath) {
+      result.push(`${leadingWs}$${trimmed}$${trailingWs}`);
+    } else {
+      result.push(text);
+    }
+    currentMathGroup = [];
+  };
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (/^\s+$/.test(token)) {
+      if (currentMathGroup.length > 0) {
+        currentMathGroup.push(token);
+      } else {
+        result.push(token);
+      }
+      continue;
+    }
+
+    const stripped = token.replace(/[.,:;?!]$/, "");
+    const trailingPunct = token.slice(stripped.length);
+
+    if (isMathPiece(stripped)) {
+      currentMathGroup.push(stripped);
+      if (trailingPunct) {
+        flushMathGroup();
+        result.push(trailingPunct);
+      }
+    } else {
+      flushMathGroup();
+      result.push(token);
+    }
+  }
+
+  flushMathGroup();
+  return result.join("");
 }
 
 /**
@@ -159,12 +248,13 @@ export function sanitizeMathProse(input: string): string {
       raw = raw.slice(2, -2).trim();
     }
 
-    // Check if this block contains 4 or more consecutive English words (excluding words inside \text{...})
-    const strippedOfText = raw.replace(/\\text\{[^{}]*\}/g, "");
-    const fourWordsRegex = /[A-Za-z]{2,}(?:[\s\-_]+[A-Za-z]{2,}){3,}/;
+    // Strip known LaTeX commands (\frac, \Delta, \alpha, \text, \mathrm, etc.) to count genuine prose words
+    const strippedCommands = raw.replace(/\\[a-zA-Z]+(?:\{[^{}]*\}|\[[^[\]]*\])*/g, " ");
+    const words = strippedCommands.match(/[A-Za-z]{3,}/g) || [];
 
-    if (fourWordsRegex.test(strippedOfText)) {
-      // Prose was mistakenly enclosed in math delimiters -> unwrap and re-wrap only true math expressions
+    // If the block contains 2 or more English words (e.g. "$The incorrect statement is$", "$Isothermal process$", "$Given below are two statements$")
+    if (words.length >= 2) {
+      // Accidental math-wrapped prose -> strip outer delimiters and re-wrap only genuine math tokens
       return rewrapMathTokens(raw);
     }
 

@@ -1203,6 +1203,7 @@ CRITICAL INSTRUCTIONS:
 4. LATEX & ESCAPING (CRITICAL):
    - Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta, \\sqrt, \\alpha) so the output is 100% valid JSON.
    - Wrap inline math in '$...$' and display math in '$$...$$'.
+   - STRICT RULE: NEVER wrap English sentences, options, or explanations in '$...$' or '$$...$$'. Only wrap actual mathematical formulas, variables (e.g. $x$, $\theta$), numbers with exponents, or chemical equations in math delimiters. Normal English text MUST be written bare without '$'.
    - NEVER output raw placeholding strings like "(a) Image", "(b) Image", or "[Image]" in "question_text". Instead, use natural phrasing like "Refer to structures (a) and (b) in the figure:" or simply describe the problem statement clearly.
 
 5. MCQ OPTIONS & CORRECT ANSWER:
@@ -1552,10 +1553,15 @@ ${batchPromptTemplate}`,
         exam_id: examId,
         subject: q.subject,
         type: q.type,
-        question_text: q.question_text.trim(),
-        options: q.type === "mcq" ? q.options : null,
+        question_text: sanitizeMathProse(q.question_text.trim()),
+        options:
+          q.type === "mcq" && q.options
+            ? q.options.map((opt) => sanitizeMathProse(opt.trim()))
+            : null,
         correct_answer: q.correct_answer.trim(),
-        explanation: q.explanation?.trim() || null,
+        explanation: q.explanation?.trim()
+          ? sanitizeMathProse(q.explanation.trim())
+          : null,
         positive_marks: q.positive_marks,
         negative_marks: q.negative_marks,
         order_index: idx + 1,

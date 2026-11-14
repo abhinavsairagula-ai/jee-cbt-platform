@@ -5,7 +5,7 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import type { Exam, Question, Subject, QuestionType } from "@/types/database";
-import MathView from "@/components/MathView";
+import MathView, { sanitizeMathProse } from "@/components/MathView";
 import {
   ArrowLeft,
   PlusCircle,
@@ -198,7 +198,12 @@ function ExamQuestionsContent() {
 
       const optionsArray =
         questionType === "mcq"
-          ? [optionA.trim(), optionB.trim(), optionC.trim(), optionD.trim()]
+          ? [
+              sanitizeMathProse(optionA.trim()),
+              sanitizeMathProse(optionB.trim()),
+              sanitizeMathProse(optionC.trim()),
+              sanitizeMathProse(optionD.trim()),
+            ]
           : null;
 
       const correctAnswerValue =
@@ -208,10 +213,12 @@ function ExamQuestionsContent() {
         exam_id: examId,
         subject,
         type: questionType,
-        question_text: questionText.trim(),
+        question_text: sanitizeMathProse(questionText.trim()),
         options: optionsArray,
         correct_answer: correctAnswerValue,
-        explanation: explanation.trim() || null,
+        explanation: explanation.trim()
+          ? sanitizeMathProse(explanation.trim())
+          : null,
         positive_marks: Number(positiveMarks),
         negative_marks: Number(negativeMarks),
       };
