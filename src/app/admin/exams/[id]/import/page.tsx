@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import { safeParseJson } from "@/lib/json-repair";
+import { GoogleGenAI } from "@google/genai";
 import type { Exam, Subject, QuestionType } from "@/types/database";
 import MathView from "@/components/MathView";
 import {
@@ -69,6 +70,54 @@ const SUBJECT_CONFIG: Record<
   },
 };
 
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      const base64 = result.includes(",") ? result.split(",")[1] : result;
+      resolve(base64);
+    };
+    reader.onerror = (err) => reject(err);
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatGeminiErrorMessage(err: unknown): string {
+  if (!err) return "Unknown error occurred.";
+  if (typeof err === "string") return err;
+
+  if (err instanceof Error) {
+    const status = (err as { status?: number }).status;
+    const rawMsg = err.message || "";
+
+    try {
+      const parsed = JSON.parse(rawMsg);
+      if (parsed.error?.message) {
+        let innerMsg = parsed.error.message;
+        try {
+          const innerParsed = JSON.parse(innerMsg);
+          if (innerParsed.error?.message) {
+            innerMsg = innerParsed.error.message;
+          }
+        } catch {}
+        const code = parsed.error.code || status || "";
+        const codePrefix = code ? `[HTTP ${code}] ` : "";
+        return `${codePrefix}${innerMsg}`;
+      }
+      if (parsed.message) {
+        const codePrefix = status ? `[HTTP ${status}] ` : "";
+        return `${codePrefix}${parsed.message}`;
+      }
+    } catch {}
+
+    const codePrefix = status ? `[HTTP ${status}] ` : "";
+    return `${codePrefix}${rawMsg}`;
+  }
+
+  return String(err);
+}
+
 function PdfImportContent() {
   const params = useParams();
   const examId = params?.id as string;
@@ -84,16 +133,20 @@ function PdfImportContent() {
   const qInputRef = useRef<HTMLInputElement | null>(null);
   const sInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Gemini Configuration (No restriction on keys starting with AQ. or AIza)
+  // Gemini Configuration (reads localStorage or NEXT_PUBLIC_GEMINI_API_KEY fallback)
   const [apiKey, setApiKey] = useState(() => {
     if (typeof window !== "undefined") {
       try {
-        return localStorage.getItem("jee_gemini_api_key") || "";
+        return (
+          localStorage.getItem("jee_gemini_api_key") ||
+          process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
+          ""
+        );
       } catch {
-        return "";
+        return process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
       }
     }
-    return "";
+    return process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
   });
   const [model, setModel] = useState("gemini-3.8-flash");
 
@@ -179,10 +232,24 @@ function PdfImportContent() {
     setErrorMessage("Parsing was cancelled.");
   };
 
-  // Start AI Parsing with Direct Supabase Storage Upload & Streaming
+  // Start AI Parsing: Runs 100% Client-Side to avoid Vercel 60s Serverless Timeout
   const handleParsePdf = async () => {
     if (!questionPdf) {
       setErrorMessage("Please select a Question Paper PDF file.");
+      return;
+    }
+
+    // Resolve API Key: User input > NEXT_PUBLIC_GEMINI_API_KEY
+    const effectiveApiKey = (
+      apiKey.trim() ||
+      process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
+      ""
+    ).trim();
+
+    if (!effectiveApiKey) {
+      setErrorMessage(
+        "Gemini API Key is missing. Please enter your Gemini API key in the settings input box or set NEXT_PUBLIC_GEMINI_API_KEY in your Vercel project environment variables."
+      );
       return;
     }
 
@@ -191,7 +258,7 @@ function PdfImportContent() {
     setIsParsing(true);
     setParseProgress(5);
     setElapsedSeconds(0);
-    setParseStatus("Uploading Question Paper directly to Supabase Storage...");
+    setParseStatus("Reading PDF documents into base64...");
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -208,122 +275,166 @@ function PdfImportContent() {
         setParseProgress((p) => Math.max(p, Math.min(55, 30 + (seconds - 5) * 3)));
       } else if (seconds < 25) {
         setParseProgress((p) => Math.max(p, Math.min(75, 55 + (seconds - 12) * 2)));
-      } else if (seconds < 40) {
+      } else if (seconds < 45) {
         setParseProgress((p) => Math.max(p, Math.min(90, 75 + (seconds - 25) * 1)));
       } else {
-        setParseProgress((p) => Math.max(p, Math.min(96, 90 + Math.floor((seconds - 40) / 4))));
+        setParseProgress((p) => Math.max(p, Math.min(96, 90 + Math.floor((seconds - 45) / 4))));
       }
     }, 1000);
 
     try {
-      // 1. Upload Question Paper PDF directly to Supabase Storage bucket 'exam-pdfs'
-      setParseStatus("Uploading Question Paper to Supabase Storage ('exam-pdfs')...");
+      // 1. Convert Question Paper PDF to base64
+      setParseStatus("Reading Question Paper PDF into memory...");
       setParseProgress(10);
+      const qBase64 = await fileToBase64(questionPdf);
 
-      const qExt = questionPdf.name.split(".").pop() || "pdf";
-      const qFileName = `${examId}/question_${Date.now()}.${qExt}`;
-
-      const { data: qUploadData, error: qUploadErr } = await supabase.storage
+      // Non-blocking background backup to Supabase Storage
+      supabase.storage
         .from("exam-pdfs")
-        .upload(qFileName, questionPdf, {
+        .upload(`${examId}/question_${Date.now()}.pdf`, questionPdf, {
           cacheControl: "3600",
           upsert: true,
+        })
+        .catch((storageErr) => {
+          console.warn("Supabase storage backup notice:", storageErr?.message);
         });
 
-      if (qUploadErr) {
-        throw new Error(
-          `Failed to upload Question Paper to storage: ${qUploadErr.message}. Ensure the 'exam-pdfs' bucket exists.`
-        );
-      }
+      // 2. Convert Solution Paper if provided
+      let solutionNote = "";
+      const parts: Array<
+        | { inlineData: { mimeType: string; data: string } }
+        | { text: string }
+      > = [
+        {
+          inlineData: {
+            mimeType: "application/pdf",
+            data: qBase64,
+          },
+        },
+      ];
 
-      const { data: qUrlData } = supabase.storage
-        .from("exam-pdfs")
-        .getPublicUrl(qUploadData?.path || qFileName);
-
-      const questionPdfUrl = qUrlData.publicUrl;
-
-      // 2. Upload Solution PDF (if provided)
-      let solutionPdfUrl: string | null = null;
       if (solutionPdf) {
-        setParseStatus("Uploading Solution Paper to Supabase Storage ('exam-pdfs')...");
+        setParseStatus("Reading Solution Paper PDF into memory...");
         setParseProgress(20);
-
-        const sExt = solutionPdf.name.split(".").pop() || "pdf";
-        const sFileName = `${examId}/solution_${Date.now()}.${sExt}`;
-
-        const { data: sUploadData, error: sUploadErr } = await supabase.storage
-          .from("exam-pdfs")
-          .upload(sFileName, solutionPdf, {
-            cacheControl: "3600",
-            upsert: true,
+        try {
+          const sBase64 = await fileToBase64(solutionPdf);
+          parts.push({
+            inlineData: {
+              mimeType: "application/pdf",
+              data: sBase64,
+            },
           });
+          solutionNote =
+            "DOCUMENT 2 is the OFFICIAL SOLUTION & ANSWER KEY PAPER. Match each question from Document 1 with its corresponding official answer key and step-by-step solution from Document 2.";
 
-        if (sUploadErr) {
-          throw new Error(
-            `Failed to upload Solution Paper to storage: ${sUploadErr.message}`
-          );
+          supabase.storage
+            .from("exam-pdfs")
+            .upload(`${examId}/solution_${Date.now()}.pdf`, solutionPdf, {
+              cacheControl: "3600",
+              upsert: true,
+            })
+            .catch((storageErr) => {
+              console.warn("Supabase solution storage backup notice:", storageErr?.message);
+            });
+        } catch (sErr) {
+          console.warn("Failed to encode solution paper:", sErr);
         }
-
-        const { data: sUrlData } = supabase.storage
-          .from("exam-pdfs")
-          .getPublicUrl(sUploadData?.path || sFileName);
-
-        solutionPdfUrl = sUrlData.publicUrl;
       }
 
-      // 3. Send JSON POST request to /api/admin/exams/[id]/parse-pdf
-      setParseStatus("Connecting to Gemini streaming AI extractor...");
+      if (!solutionNote) {
+        solutionNote =
+          "No separate solution paper is provided. Solve each question with complete accuracy, determine the correct answer, and provide a clear, step-by-step mathematical/conceptual solution.";
+      }
+
+      const systemPrompt = `You are an expert NTA JEE (Main) Question Paper Digitizer, LaTeX/KaTeX formatter, and academic examiner.
+Your task is to parse and extract ALL questions from the attached Question Paper PDF (Document 1).
+${solutionNote}
+
+STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
+1. SUBJECT IDENTIFICATION:
+   - Assign each question to its exact subject: "physics", "chemistry", or "mathematics".
+   - Maintain the standard order of the JEE examination (Section A: Physics, Section B: Chemistry, Section C: Mathematics).
+
+2. QUESTION TYPE:
+   - "mcq": Questions with 4 options.
+   - "numerical": Questions requiring an integer or decimal numerical answer without options.
+
+3. KATEX / LATEX FORMATTING & BACKSLASH ESCAPING (CRITICAL):
+   - Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta) so the output is 100% valid JSON.
+   - Every single variable, equation, scientific notation, unit, chemical formula, or mathematical symbol MUST be formatted in standard KaTeX.
+   - Use '$...$' for inline math (e.g. '$x^2 + y^2 = r^2$', '$\\frac{hc}{\\lambda}$', '$\\text{KMnO}_4$').
+   - Use '$$...$$' for standalone or display equations.
+   - In JSON, ALWAYS write double backslashes for all LaTeX commands: use '\\\\frac', '\\\\int', '\\\\theta', '\\\\alpha', '\\\\sin', '\\\\vec', '\\\\sqrt', '\\\\cos', '\\\\text', '\\\\sum', etc. Never write a single backslash.
+   - Format chemical species and reactions properly (e.g., '$\\text{H}_2\\text{SO}_4$', '$\\text{Zn} + 2\\text{HCl} \\rightarrow \\text{ZnCl}_2 + \\text{H}_2$').
+
+4. MCQ OPTIONS & ANSWER:
+   - For 'mcq', 'options' MUST be an array of EXACTLY 4 strings: [Option A text, Option B text, Option C text, Option D text].
+   - Strip leading labels like "(A)", "(1)", "A.", "1.", "Option A:" from the option text. Retain only the option content/formula.
+   - 'correct_answer' MUST be one of: "A", "B", "C", or "D". If the paper uses numbers 1, 2, 3, 4, map 1->A, 2->B, 3->C, 4->D.
+
+5. NUMERICAL QUESTIONS:
+   - For 'numerical', 'options' MUST be null.
+   - 'correct_answer' MUST be the final numerical value string (e.g. "25", "3.5", "-4").
+
+6. EXPLANATION:
+   - Provide a concise 2-4 line derivation/rationale for 'explanation' highlighting the key formula and final numerical steps in KaTeX. Keep explanations focused to ensure fast processing.
+
+7. OUTPUT SCHEMA:
+   Return valid JSON with NO conversational markdown preamble or postscript.
+   CRITICAL: Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta) so the output is 100% valid JSON:
+   {
+     "exam_title": "string or exam name found in paper",
+     "questions": [
+       {
+         "subject": "physics" | "chemistry" | "mathematics",
+         "type": "mcq" | "numerical",
+         "question_text": "string with $KaTeX$ (all LaTeX backslashes double-escaped as \\\\)",
+         "options": ["string", "string", "string", "string"] | null,
+         "correct_answer": "A" | "B" | "C" | "D" | "numerical_string",
+         "explanation": "string with $KaTeX$ (all LaTeX backslashes double-escaped as \\\\)"
+       }
+     ]
+   }`;
+
+      parts.push({ text: systemPrompt });
+
+      // 3. Initialize GoogleGenAI client directly in browser
+      const chosenModel = (model || "gemini-3.8-flash").replace(/^models\//, "");
+      setParseStatus(`Connecting directly to Gemini API (${chosenModel})...`);
       setParseProgress(30);
 
-      const res = await fetch(`/api/admin/exams/${examId}/parse-pdf`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+      const ai = new GoogleGenAI({ apiKey: effectiveApiKey });
+
+      const responseStream = await ai.models.generateContentStream({
+        model: chosenModel,
+        contents: parts,
+        config: {
+          responseMimeType: "application/json",
+          thinkingConfig: {
+            thinkingBudget: 0,
+          },
+          abortSignal: controller.signal,
         },
-        body: JSON.stringify({
-          questionPdfUrl,
-          solutionPdfUrl,
-          apiKey: apiKey.trim() || undefined,
-          model: model || "gemini-3.8-flash",
-        }),
-        signal: controller.signal,
       });
 
-      if (!res.ok) {
-        const errText = await res.text();
-        let errMsg = errText;
-        try {
-          const errJson = JSON.parse(errText);
-          errMsg = errJson.error || errText;
-        } catch {
-          // Keep text
-        }
-        throw new Error(errMsg || `Server returned error (${res.status})`);
-      }
-
-      // 4. Read response stream chunk by chunk
-      if (!res.body) {
-        throw new Error("No response body stream received from server.");
-      }
-
-      setParseStatus("Streaming question extraction from Gemini AI...");
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder("utf-8");
+      // 4. Stream chunks directly into browser
+      setParseStatus("Streaming question extraction directly from Gemini AI...");
       let fullText = "";
       let receivedBytes = 0;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          receivedBytes += value.length;
-          fullText += decoder.decode(value, { stream: true });
+      for await (const chunk of responseStream) {
+        if (controller.signal.aborted) {
+          throw new DOMException("Extraction was cancelled.", "AbortError");
+        }
+        const text = chunk.text;
+        if (text) {
+          fullText += text;
+          receivedBytes += text.length;
           setParseStatus(
-            `Streaming questions (${(receivedBytes / 1024).toFixed(1)} KB received)...`
+            `Streaming questions directly from Gemini (${(receivedBytes / 1024).toFixed(1)} KB received)...`
           );
         }
       }
-      fullText += decoder.decode();
 
       clearInterval(timerInterval);
       setParseProgress(98);
@@ -434,15 +545,15 @@ function PdfImportContent() {
       );
     } catch (err: unknown) {
       clearInterval(timerInterval);
-      if (err instanceof DOMException && err.name === "AbortError") {
+      if (
+        (err instanceof DOMException && err.name === "AbortError") ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
         setErrorMessage("Extraction was cancelled.");
       } else {
-        console.error("AI Parse failed:", err);
-        setErrorMessage(
-          err instanceof Error
-            ? err.message
-            : "Failed to parse PDF with Gemini API."
-        );
+        console.error("Client AI Parse failed:", err);
+        const detailedError = formatGeminiErrorMessage(err);
+        setErrorMessage(detailedError);
       }
     } finally {
       clearInterval(timerInterval);
@@ -859,7 +970,9 @@ function PdfImportContent() {
               <label className="block text-[11px] font-semibold text-slate-300 mb-1 flex items-center justify-between">
                 <span>Gemini API Key</span>
                 <span className="text-[10px] text-slate-500 font-normal">
-                  Optional if set in .env.local
+                  {process.env.NEXT_PUBLIC_GEMINI_API_KEY
+                    ? "NEXT_PUBLIC_GEMINI_API_KEY active as default"
+                    : "Enter key or set NEXT_PUBLIC_GEMINI_API_KEY"}
                 </span>
               </label>
               <div className="relative">
@@ -867,7 +980,11 @@ function PdfImportContent() {
                   type="password"
                   value={apiKey}
                   onChange={(e) => handleApiKeyChange(e.target.value)}
-                  placeholder="AIzaSy... or AQ... (leave blank to use server env)"
+                  placeholder={
+                    process.env.NEXT_PUBLIC_GEMINI_API_KEY
+                      ? "Using NEXT_PUBLIC_GEMINI_API_KEY (or override here)"
+                      : "AIzaSy... or AQ... (leave blank if set in env)"
+                  }
                   className="w-full pl-8 pr-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs placeholder:text-slate-600 focus:outline-none focus:border-purple-500 transition"
                 />
                 <Key className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
@@ -963,7 +1080,7 @@ function PdfImportContent() {
               ({questionPdf ? (questionPdf.size / (1024 * 1024)).toFixed(2) : 0} MB)
             </span>
             <span className="text-cyan-400/80 font-medium">
-              Direct Supabase Upload • Gemini 3.8 Flash Streaming
+              Client-Side Direct Gemini Streaming • Zero Vercel Timeout
             </span>
           </div>
         </div>
