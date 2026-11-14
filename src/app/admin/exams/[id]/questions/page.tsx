@@ -695,8 +695,17 @@ function ExamQuestionsContent() {
                 </div>
 
                 {/* Question Statement with KaTeX */}
-                <div className="text-sm text-slate-100 leading-relaxed font-normal">
+                <div className="text-sm text-slate-100 leading-relaxed font-normal space-y-2">
                   <MathView math={q.question_text} />
+                  {q.image_url && (
+                    <div className="pt-2">
+                      <img
+                        src={q.image_url}
+                        alt="Question Diagram"
+                        className="max-h-56 max-w-full rounded-xl border border-slate-800 bg-white/5 object-contain"
+                      />
+                    </div>
+                  )}
                 </div>
 
                 {/* MCQ Options Display */}

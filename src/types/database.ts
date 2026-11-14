@@ -28,6 +28,7 @@ export interface Question {
   positive_marks: number;
   negative_marks: number;
   order_index?: number;
+  image_url?: string | null;
   created_at?: string;
 }
 

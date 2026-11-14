@@ -6,6 +6,7 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import { safeParseJson } from "@/lib/json-repair";
 import { GoogleGenAI } from "@google/genai";
+import * as pdfjsLib from "pdfjs-dist";
 import type { Exam, Subject, QuestionType } from "@/types/database";
 import MathView from "@/components/MathView";
 import {
@@ -27,7 +28,16 @@ import {
   Key,
   Cpu,
   ChevronDown,
+  Image as ImageIcon,
+  ImagePlus,
+  ExternalLink,
+  RotateCcw,
 } from "lucide-react";
+
+// Configure pdfjs worker for client-side rendering
+if (typeof window !== "undefined" && pdfjsLib.GlobalWorkerOptions) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+}
 
 interface EditableQuestion {
   id: string;
@@ -40,6 +50,9 @@ interface EditableQuestion {
   explanation: string;
   positive_marks: number;
   negative_marks: number;
+  image_url?: string | null;
+  has_diagram?: boolean;
+  diagram_bbox?: [number, number, number, number] | null;
   isPreviewMode?: boolean;
 }
 
@@ -69,19 +82,6 @@ const SUBJECT_CONFIG: Record<
     bg: "border-indigo-500/30 hover:border-indigo-500/60",
   },
 };
-
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      const base64 = result.includes(",") ? result.split(",")[1] : result;
-      resolve(base64);
-    };
-    reader.onerror = (err) => reject(err);
-    reader.readAsDataURL(file);
-  });
-}
 
 function formatGeminiErrorMessage(err: unknown): string {
   if (!err) return "Unknown error occurred.";
@@ -118,6 +118,170 @@ function formatGeminiErrorMessage(err: unknown): string {
   return String(err);
 }
 
+// Crop bounding box from high-res canvas with padding
+async function cropDiagramToBlob(
+  canvas: HTMLCanvasElement,
+  bbox: [number, number, number, number]
+): Promise<Blob | null> {
+  try {
+    const [ymin, xmin, ymax, xmax] = bbox;
+    if (ymin >= ymax || xmin >= xmax) return null;
+
+    const cW = canvas.width;
+    const cH = canvas.height;
+
+    // Convert normalized 0-1000 coordinates to canvas pixels
+    let x1 = (xmin / 1000) * cW;
+    let y1 = (ymin / 1000) * cH;
+    let x2 = (xmax / 1000) * cW;
+    let y2 = (ymax / 1000) * cH;
+
+    // Add 16px padding
+    const pad = 16;
+    x1 = Math.max(0, Math.floor(x1 - pad));
+    y1 = Math.max(0, Math.floor(y1 - pad));
+    x2 = Math.min(cW, Math.ceil(x2 + pad));
+    y2 = Math.min(cH, Math.ceil(y2 + pad));
+
+    const width = x2 - x1;
+    const height = y2 - y1;
+    if (width < 25 || height < 25) return null;
+
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = width;
+    cropCanvas.height = height;
+    const ctx = cropCanvas.getContext("2d");
+    if (!ctx) return null;
+
+    ctx.drawImage(canvas, x1, y1, width, height, 0, 0, width, height);
+
+    return new Promise<Blob | null>((resolve) => {
+      cropCanvas.toBlob((blob) => resolve(blob), "image/png");
+    });
+  } catch (err) {
+    console.warn("Diagram cropping error:", err);
+    return null;
+  }
+}
+
+// Upload cropped diagram blob to Supabase Storage with bucket fallback
+async function uploadDiagramBlob(
+  supabase: ReturnType<typeof createClient>,
+  examId: string,
+  qIdx: number,
+  blob: Blob
+): Promise<string | null> {
+  const filename = `${Date.now()}-q${qIdx}.png`;
+
+  // 1. Try 'question-images' bucket
+  try {
+    const path = `${examId}/${filename}`;
+    const { error } = await supabase.storage
+      .from("question-images")
+      .upload(path, blob, { contentType: "image/png", upsert: true });
+
+    if (!error) {
+      const { data } = supabase.storage.from("question-images").getPublicUrl(path);
+      if (data?.publicUrl) return data.publicUrl;
+    }
+  } catch {}
+
+  // 2. Fallback to 'exam-pdfs' bucket
+  try {
+    const fbPath = `diagrams/${examId}/${filename}`;
+    const { error: fbErr } = await supabase.storage
+      .from("exam-pdfs")
+      .upload(fbPath, blob, { contentType: "image/png", upsert: true });
+
+    if (!fbErr) {
+      const { data } = supabase.storage.from("exam-pdfs").getPublicUrl(fbPath);
+      if (data?.publicUrl) return data.publicUrl;
+    }
+  } catch (err) {
+    console.warn("Storage upload error for diagram:", err);
+  }
+
+  return null;
+}
+
+// Execute Gemini call per batch with strict 45-second timeout and 1 retry
+async function callGeminiBatchWithTimeoutAndRetry(
+  ai: GoogleGenAI,
+  modelName: string,
+  parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }>,
+  batchLabel: string,
+  parentSignal: AbortSignal
+): Promise<string> {
+  const MAX_RETRIES = 1;
+  let attempt = 0;
+  let currentModel = modelName;
+
+  while (attempt <= MAX_RETRIES) {
+    attempt++;
+    const controller = new AbortController();
+
+    const onParentAbort = () => controller.abort();
+    parentSignal.addEventListener("abort", onParentAbort);
+
+    // 45s strict timeout per batch
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 45000);
+
+    try {
+      const responseStream = await ai.models.generateContentStream({
+        model: currentModel,
+        contents: parts as any,
+        config: {
+          responseMimeType: "application/json",
+          thinkingConfig: {
+            thinkingBudget: 0,
+          },
+          abortSignal: controller.signal,
+        },
+      });
+
+      let fullText = "";
+      for await (const chunk of responseStream) {
+        if (parentSignal.aborted) {
+          throw new DOMException("Extraction was cancelled by user.", "AbortError");
+        }
+        if (chunk.text) {
+          fullText += chunk.text;
+        }
+      }
+
+      clearTimeout(timeoutId);
+      parentSignal.removeEventListener("abort", onParentAbort);
+      return fullText;
+    } catch (err: unknown) {
+      clearTimeout(timeoutId);
+      parentSignal.removeEventListener("abort", onParentAbort);
+
+      if (parentSignal.aborted) {
+        throw new DOMException("Extraction was cancelled by user.", "AbortError");
+      }
+
+      console.warn(`[Batch ${batchLabel}] Attempt ${attempt} failed:`, err);
+
+      // If model not found (404), fall back to gemini-2.5-flash
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes("404") || errMsg.includes("not found")) {
+        currentModel = "gemini-2.5-flash";
+      }
+
+      if (attempt > MAX_RETRIES) {
+        throw err;
+      }
+
+      // Small backoff before retry
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+  }
+
+  throw new Error(`Failed to extract batch ${batchLabel} after retry.`);
+}
+
 function PdfImportContent() {
   const params = useParams();
   const examId = params?.id as string;
@@ -132,6 +296,10 @@ function PdfImportContent() {
   const [solutionPdf, setSolutionPdf] = useState<File | null>(null);
   const qInputRef = useRef<HTMLInputElement | null>(null);
   const sInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Diagram Manual Upload
+  const [activeDiagramQId, setActiveDiagramQId] = useState<string | null>(null);
+  const diagramFileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Gemini Configuration (reads localStorage or NEXT_PUBLIC_GEMINI_API_KEY fallback)
   const [apiKey, setApiKey] = useState(() => {
@@ -232,7 +400,69 @@ function PdfImportContent() {
     setErrorMessage("Parsing was cancelled.");
   };
 
-  // Start AI Parsing: Runs 100% Client-Side to avoid Vercel 60s Serverless Timeout
+  // Trigger manual diagram file selection
+  const triggerAddDiagram = (qId: string) => {
+    setActiveDiagramQId(qId);
+    diagramFileInputRef.current?.click();
+  };
+
+  const triggerReplaceDiagram = (qId: string) => {
+    setActiveDiagramQId(qId);
+    diagramFileInputRef.current?.click();
+  };
+
+  const handleDiagramFileSelected = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file || !activeDiagramQId) return;
+
+    try {
+      const filename = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.-]/g, "_")}`;
+      let publicUrl: string | null = null;
+
+      // Try question-images
+      try {
+        const path = `${examId}/${filename}`;
+        const { error } = await supabase.storage
+          .from("question-images")
+          .upload(path, file, { contentType: file.type, upsert: true });
+
+        if (!error) {
+          publicUrl = supabase.storage.from("question-images").getPublicUrl(path).data.publicUrl;
+        }
+      } catch {}
+
+      // Fallback to exam-pdfs/diagrams/
+      if (!publicUrl) {
+        try {
+          const fbPath = `diagrams/${examId}/${filename}`;
+          const { error: fbErr } = await supabase.storage
+            .from("exam-pdfs")
+            .upload(fbPath, file, { contentType: file.type, upsert: true });
+
+          if (!fbErr) {
+            publicUrl = supabase.storage.from("exam-pdfs").getPublicUrl(fbPath).data.publicUrl;
+          }
+        } catch {}
+      }
+
+      if (publicUrl) {
+        updateQuestionField(activeDiagramQId, "image_url", publicUrl);
+        updateQuestionField(activeDiagramQId, "has_diagram", true);
+      } else {
+        setErrorMessage("Failed to upload image to storage.");
+      }
+    } catch (err) {
+      console.error("Diagram upload error:", err);
+      setErrorMessage("Failed to upload image file.");
+    } finally {
+      setActiveDiagramQId(null);
+      if (diagramFileInputRef.current) diagramFileInputRef.current.value = "";
+    }
+  };
+
+  // Client-Side PDF-to-Image Rendering and Batched Extraction
   const handleParsePdf = async () => {
     if (!questionPdf) {
       setErrorMessage("Please select a Question Paper PDF file.");
@@ -256,9 +486,9 @@ function PdfImportContent() {
     setErrorMessage(null);
     setSuccessMessage(null);
     setIsParsing(true);
-    setParseProgress(5);
+    setParseProgress(2);
     setElapsedSeconds(0);
-    setParseStatus("Reading PDF documents into base64...");
+    setParseStatus("Initializing PDF renderer...");
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -267,281 +497,305 @@ function PdfImportContent() {
     const timerInterval = setInterval(() => {
       seconds += 1;
       setElapsedSeconds(seconds);
-
-      // Smooth progressive updates
-      if (seconds < 5) {
-        setParseProgress((p) => Math.max(p, Math.min(30, 10 + seconds * 4)));
-      } else if (seconds < 12) {
-        setParseProgress((p) => Math.max(p, Math.min(55, 30 + (seconds - 5) * 3)));
-      } else if (seconds < 25) {
-        setParseProgress((p) => Math.max(p, Math.min(75, 55 + (seconds - 12) * 2)));
-      } else if (seconds < 45) {
-        setParseProgress((p) => Math.max(p, Math.min(90, 75 + (seconds - 25) * 1)));
-      } else {
-        setParseProgress((p) => Math.max(p, Math.min(96, 90 + Math.floor((seconds - 45) / 4))));
-      }
     }, 1000);
 
     try {
-      // 1. Convert Question Paper PDF to base64
-      setParseStatus("Reading Question Paper PDF into memory...");
-      setParseProgress(10);
-      const qBase64 = await fileToBase64(questionPdf);
-
-      // Non-blocking background backup to Supabase Storage
+      // 1. Background backup of uploaded PDFs to Supabase Storage
       supabase.storage
         .from("exam-pdfs")
         .upload(`${examId}/question_${Date.now()}.pdf`, questionPdf, {
           cacheControl: "3600",
           upsert: true,
         })
-        .catch((storageErr) => {
-          console.warn("Supabase storage backup notice:", storageErr?.message);
-        });
-
-      // 2. Convert Solution Paper if provided
-      let solutionNote = "";
-      const parts: Array<
-        | { inlineData: { mimeType: string; data: string } }
-        | { text: string }
-      > = [
-        {
-          inlineData: {
-            mimeType: "application/pdf",
-            data: qBase64,
-          },
-        },
-      ];
+        .catch(() => {});
 
       if (solutionPdf) {
-        setParseStatus("Reading Solution Paper PDF into memory...");
-        setParseProgress(20);
-        try {
-          const sBase64 = await fileToBase64(solutionPdf);
-          parts.push({
-            inlineData: {
-              mimeType: "application/pdf",
-              data: sBase64,
-            },
-          });
-          solutionNote =
-            "DOCUMENT 2 is the OFFICIAL SOLUTION & ANSWER KEY PAPER. Match each question from Document 1 with its corresponding official answer key and step-by-step solution from Document 2.";
-
-          supabase.storage
-            .from("exam-pdfs")
-            .upload(`${examId}/solution_${Date.now()}.pdf`, solutionPdf, {
-              cacheControl: "3600",
-              upsert: true,
-            })
-            .catch((storageErr) => {
-              console.warn("Supabase solution storage backup notice:", storageErr?.message);
-            });
-        } catch (sErr) {
-          console.warn("Failed to encode solution paper:", sErr);
-        }
+        supabase.storage
+          .from("exam-pdfs")
+          .upload(`${examId}/solution_${Date.now()}.pdf`, solutionPdf, {
+            cacheControl: "3600",
+            upsert: true,
+          })
+          .catch(() => {});
       }
 
-      if (!solutionNote) {
-        solutionNote =
-          "No separate solution paper is provided. Solve each question with complete accuracy, determine the correct answer, and provide a clear, step-by-step mathematical/conceptual solution.";
+      // 2. Load PDF into memory with pdfjs-dist
+      setParseStatus("Loading Question Paper PDF into memory...");
+      const qArrayBuffer = await questionPdf.arrayBuffer();
+      if (controller.signal.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+
+      const pdfDoc = await pdfjsLib.getDocument({ data: qArrayBuffer }).promise;
+      const numPages = pdfDoc.numPages;
+
+      // 3. Render all pages locally onto high-resolution HTML5 canvas at 2.0x scale
+      setParseStatus(`Rendering ${numPages} PDF pages onto high-resolution canvas (2.0x scale)...`);
+      const pageCanvases: HTMLCanvasElement[] = [];
+      const pageJpegs: string[] = [];
+
+      for (let p = 1; p <= numPages; p++) {
+        if (controller.signal.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+        setParseStatus(`Rendering page ${p} of ${numPages} to high-res canvas...`);
+        setParseProgress(Math.min(25, 3 + Math.floor((p / numPages) * 22)));
+
+        const page = await pdfDoc.getPage(p);
+        const viewport = page.getViewport({ scale: 2.0 });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.floor(viewport.width);
+        canvas.height = Math.floor(viewport.height);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("Could not acquire 2D canvas rendering context");
+
+        await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+        pageCanvases.push(canvas);
+
+        // Convert to compressed JPEG (0.85 quality)
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+        const base64 = dataUrl.split(",")[1];
+        pageJpegs.push(base64);
       }
 
-      const systemPrompt = `You are an expert NTA JEE (Main) Question Paper Digitizer, LaTeX/KaTeX formatter, and academic examiner.
-Your task is to parse and extract ALL questions from the attached Question Paper PDF (Document 1).
-${solutionNote}
-
-STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
-1. SUBJECT IDENTIFICATION:
-   - Assign each question to its exact subject: "physics", "chemistry", or "mathematics".
-   - Maintain the standard order of the JEE examination (Section A: Physics, Section B: Chemistry, Section C: Mathematics).
-
-2. QUESTION TYPE:
-   - "mcq": Questions with 4 options.
-   - "numerical": Questions requiring an integer or decimal numerical answer without options.
-
-3. KATEX / LATEX FORMATTING & BACKSLASH ESCAPING (CRITICAL):
-   - Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta) so the output is 100% valid JSON.
-   - Every single variable, equation, scientific notation, unit, chemical formula, or mathematical symbol MUST be formatted in standard KaTeX.
-   - Use '$...$' for inline math (e.g. '$x^2 + y^2 = r^2$', '$\\frac{hc}{\\lambda}$', '$\\text{KMnO}_4$').
-   - Use '$$...$$' for standalone or display equations.
-   - In JSON, ALWAYS write double backslashes for all LaTeX commands: use '\\\\frac', '\\\\int', '\\\\theta', '\\\\alpha', '\\\\sin', '\\\\vec', '\\\\sqrt', '\\\\cos', '\\\\text', '\\\\sum', etc. Never write a single backslash.
-   - Format chemical species and reactions properly (e.g., '$\\text{H}_2\\text{SO}_4$', '$\\text{Zn} + 2\\text{HCl} \\rightarrow \\text{ZnCl}_2 + \\text{H}_2$').
-
-4. MCQ OPTIONS & ANSWER:
-   - For 'mcq', 'options' MUST be an array of EXACTLY 4 strings: [Option A text, Option B text, Option C text, Option D text].
-   - Strip leading labels like "(A)", "(1)", "A.", "1.", "Option A:" from the option text. Retain only the option content/formula.
-   - 'correct_answer' MUST be one of: "A", "B", "C", or "D". If the paper uses numbers 1, 2, 3, 4, map 1->A, 2->B, 3->C, 4->D.
-
-5. NUMERICAL QUESTIONS:
-   - For 'numerical', 'options' MUST be null.
-   - 'correct_answer' MUST be the final numerical value string (e.g. "25", "3.5", "-4").
-
-6. EXPLANATION:
-   - Provide a concise 2-4 line derivation/rationale for 'explanation' highlighting the key formula and final numerical steps in KaTeX. Keep explanations focused to ensure fast processing.
-
-7. OUTPUT SCHEMA:
-   Return valid JSON with NO conversational markdown preamble or postscript.
-   CRITICAL: Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta) so the output is 100% valid JSON:
-   {
-     "exam_title": "string or exam name found in paper",
-     "questions": [
-       {
-         "subject": "physics" | "chemistry" | "mathematics",
-         "type": "mcq" | "numerical",
-         "question_text": "string with $KaTeX$ (all LaTeX backslashes double-escaped as \\\\)",
-         "options": ["string", "string", "string", "string"] | null,
-         "correct_answer": "A" | "B" | "C" | "D" | "numerical_string",
-         "explanation": "string with $KaTeX$ (all LaTeX backslashes double-escaped as \\\\)"
-       }
-     ]
-   }`;
-
-      parts.push({ text: systemPrompt });
-
-      // 3. Initialize GoogleGenAI client directly in browser
+      // 4. Initialize Gemini AI Client directly in browser
       const chosenModel = (model || "gemini-3.8-flash").replace(/^models\//, "");
-      setParseStatus(`Connecting directly to Gemini API (${chosenModel})...`);
-      setParseProgress(30);
-
       const ai = new GoogleGenAI({ apiKey: effectiveApiKey });
 
-      const responseStream = await ai.models.generateContentStream({
-        model: chosenModel,
-        contents: parts,
-        config: {
-          responseMimeType: "application/json",
-          thinkingConfig: {
-            thinkingBudget: 0,
-          },
-          abortSignal: controller.signal,
-        },
-      });
+      // 5. Batch processing loop (2 pages per batch for 5-10s turnaround)
+      const BATCH_SIZE = 2;
+      const totalBatches = Math.ceil(numPages / BATCH_SIZE);
+      const allExtracted: EditableQuestion[] = [];
+      let totalQuestionsFound = 0;
 
-      // 4. Stream chunks directly into browser
-      setParseStatus("Streaming question extraction directly from Gemini AI...");
-      let fullText = "";
-      let receivedBytes = 0;
+      const solutionNote = solutionPdf
+        ? "If a question corresponds to standard JEE syllabus questions, solve it with complete accuracy, determine the correct answer, and provide a clear, step-by-step mathematical/conceptual solution."
+        : "Solve each question with complete accuracy, determine the correct answer, and provide a clear, step-by-step mathematical/conceptual solution.";
 
-      for await (const chunk of responseStream) {
-        if (controller.signal.aborted) {
-          throw new DOMException("Extraction was cancelled.", "AbortError");
-        }
-        const text = chunk.text;
-        if (text) {
-          fullText += text;
-          receivedBytes += text.length;
-          setParseStatus(
-            `Streaming questions directly from Gemini (${(receivedBytes / 1024).toFixed(1)} KB received)...`
-          );
-        }
-      }
+      const batchPromptTemplate = `You are an expert NTA JEE (Main) Question Paper Digitizer, KaTeX formatter, and diagram extractor.
+${solutionNote}
 
-      clearInterval(timerInterval);
-      setParseProgress(98);
-      setParseStatus("Sanitizing LaTeX backslashes & validating JSON schema...");
+EXTRACT ALL QUESTIONS FULLY FROM THE PROVIDED PAGE IMAGES. DO NOT SKIP ANY QUESTION.
 
-      let parsedResult: { exam_title?: string; questions?: unknown[] } | unknown[];
-      try {
-        parsedResult = safeParseJson<{ exam_title?: string; questions?: unknown[] } | unknown[]>(fullText);
-      } catch (parseErr) {
-        console.error("JSON parse/repair failed:", parseErr, fullText.slice(0, 500));
-        throw new Error(
-          `Failed to parse AI response into valid JSON: ${
-            parseErr instanceof Error ? parseErr.message : String(parseErr)
-          }`
+CRITICAL INSTRUCTIONS:
+1. SUBJECT IDENTIFICATION:
+   - "physics", "chemistry", or "mathematics".
+
+2. QUESTION TYPE:
+   - "mcq" (4 options) or "numerical" (integer or decimal answer).
+
+3. DIAGRAM / FIGURE DETECTION (VERY IMPORTANT):
+   - Check if the question includes an accompanying diagram, circuit, graph, chemical structure, geometry figure, apparatus, or illustration.
+   - If YES:
+     - Set "has_diagram": true
+     - Set "diagram_page": 1 if the diagram is on the 1st image in this batch, 2 if on the 2nd image.
+     - Set "diagram_bbox": [ymin, xmin, ymax, xmax] as normalized integer coordinates from 0 to 1000 tightly enclosing ONLY the diagram/figure/graph. DO NOT include question statement text or options in the bounding box.
+   - If NO diagram:
+     - Set "has_diagram": false
+     - Set "diagram_page": null
+     - Set "diagram_bbox": null
+
+4. LATEX & ESCAPING (CRITICAL):
+   - Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta, \\sqrt, \\alpha) so the output is 100% valid JSON.
+   - Wrap inline math in '$...$' and display math in '$$...$$'.
+
+5. MCQ OPTIONS & CORRECT ANSWER:
+   - For 'mcq', 'options' MUST be an array of EXACTLY 4 strings: [Option A, Option B, Option C, Option D] without leading labels like "(A)".
+   - 'correct_answer': "A", "B", "C", or "D".
+   - For 'numerical', 'options' is null, and 'correct_answer' is the numerical value string.
+
+6. EXPLANATION:
+   - Brief 2-3 line step-by-step mathematical/conceptual solution in $KaTeX$.
+
+JSON SCHEMA TO RETURN:
+{
+  "questions": [
+    {
+      "subject": "physics" | "chemistry" | "mathematics",
+      "type": "mcq" | "numerical",
+      "question_text": "string with $KaTeX$",
+      "options": ["string", "string", "string", "string"] | null,
+      "correct_answer": "A" | "B" | "C" | "D" | "numerical_string",
+      "explanation": "string with $KaTeX$",
+      "has_diagram": true | false,
+      "diagram_page": 1 | 2 | null,
+      "diagram_bbox": [ymin, xmin, ymax, xmax] | null
+    }
+  ]
+}`;
+
+      for (let b = 0; b < totalBatches; b++) {
+        if (controller.signal.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+
+        const startPage = b * BATCH_SIZE + 1;
+        const endPage = Math.min(numPages, (b + 1) * BATCH_SIZE);
+        const batchPages: number[] = [];
+        for (let pg = startPage; pg <= endPage; pg++) batchPages.push(pg);
+
+        setParseStatus(
+          `Extracting questions from pages ${startPage}–${endPage} of ${numPages} (Batch ${b + 1}/${totalBatches})...`
         );
-      }
+        setParseProgress(25 + Math.floor((b / totalBatches) * 70));
 
-      const rawQuestions = Array.isArray(parsedResult)
-        ? parsedResult
-        : Array.isArray(parsedResult.questions)
-        ? parsedResult.questions
-        : [];
+        // Prepare image parts for this batch
+        const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [];
+        for (let i = 0; i < batchPages.length; i++) {
+          const pgNum = batchPages[i];
+          parts.push({
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: pageJpegs[pgNum - 1],
+            },
+          });
+        }
 
-      if (rawQuestions.length === 0) {
-        throw new Error("No questions were found in the AI response.");
-      }
+        parts.push({
+          text: `You are processing Page ${startPage} to Page ${endPage} of the exam paper (Image 1 is Page ${startPage}${
+            batchPages.length > 1 ? `, Image 2 is Page ${endPage}` : ""
+          }).
+${batchPromptTemplate}`,
+        });
 
-      setParseProgress(100);
-      setParseStatus("Extraction complete!");
+        // Call Gemini with 45s timeout and 1 automatic retry
+        const batchJsonText = await callGeminiBatchWithTimeoutAndRetry(
+          ai,
+          chosenModel,
+          parts,
+          `${startPage}-${endPage}`,
+          controller.signal
+        );
 
-      const defaultPosMarks = exam?.positive_marks ?? 4;
-      const defaultNegMarks = exam?.negative_marks ?? 1;
+        // Parse with safeParseJson to repair LaTeX escapes
+        let parsedBatch: any;
+        try {
+          parsedBatch = safeParseJson(batchJsonText);
+        } catch (parseErr) {
+          console.warn(`JSON repair parse failed on batch ${b + 1}:`, parseErr);
+          continue;
+        }
 
-      interface RawParsedQ {
-        subject?: string;
-        type?: string;
-        question_text?: string;
-        options?: string[] | null;
-        correct_answer?: string;
-        explanation?: string | null;
-        positive_marks?: number;
-        negative_marks?: number;
-      }
+        const rawQuestions = Array.isArray(parsedBatch)
+          ? parsedBatch
+          : Array.isArray(parsedBatch?.questions)
+          ? parsedBatch.questions
+          : [];
 
-      const extractedList: EditableQuestion[] = rawQuestions.map(
-        (item: unknown, idx: number) => {
-          const q = (item || {}) as RawParsedQ;
+        // Process questions in this batch
+        for (let qIdx = 0; qIdx < rawQuestions.length; qIdx++) {
+          const rawQ = rawQuestions[qIdx];
+          totalQuestionsFound++;
+
+          let diagramUrl: string | null = null;
+
+          // If question has a diagram, crop from corresponding canvas and upload
+          if (
+            rawQ.has_diagram &&
+            Array.isArray(rawQ.diagram_bbox) &&
+            rawQ.diagram_bbox.length === 4
+          ) {
+            setParseStatus(
+              `Cropping and uploading diagram for Question ${totalQuestionsFound}...`
+            );
+
+            let targetCanvas: HTMLCanvasElement | null = null;
+            if (typeof rawQ.diagram_page === "number") {
+              if (rawQ.diagram_page >= 1 && rawQ.diagram_page <= batchPages.length) {
+                const pgNum = batchPages[rawQ.diagram_page - 1];
+                targetCanvas = pageCanvases[pgNum - 1] || null;
+              } else if (pageCanvases[rawQ.diagram_page - 1]) {
+                targetCanvas = pageCanvases[rawQ.diagram_page - 1];
+              }
+            }
+            if (!targetCanvas && pageCanvases[batchPages[0] - 1]) {
+              targetCanvas = pageCanvases[batchPages[0] - 1];
+            }
+
+            if (targetCanvas) {
+              const blob = await cropDiagramToBlob(
+                targetCanvas,
+                rawQ.diagram_bbox as [number, number, number, number]
+              );
+              if (blob) {
+                diagramUrl = await uploadDiagramBlob(
+                  supabase,
+                  examId,
+                  totalQuestionsFound,
+                  blob
+                );
+              }
+            }
+          }
+
+          // Normalize subject
           const subject: Subject = ["physics", "chemistry", "mathematics"].includes(
-            q.subject?.toLowerCase() || ""
+            rawQ.subject?.toLowerCase() || ""
           )
-            ? (q.subject!.toLowerCase() as Subject)
+            ? (rawQ.subject.toLowerCase() as Subject)
             : "physics";
 
+          // Normalize type
           const type: QuestionType =
-            q.type?.toLowerCase() === "numerical" ? "numerical" : "mcq";
+            rawQ.type?.toLowerCase() === "numerical" ? "numerical" : "mcq";
 
+          // Normalize options
           let options: string[] | null = null;
           if (type === "mcq") {
-            if (Array.isArray(q.options) && q.options.length >= 4) {
-              options = q.options.slice(0, 4).map((opt) => String(opt ?? "").trim());
-            } else if (Array.isArray(q.options)) {
+            if (Array.isArray(rawQ.options) && rawQ.options.length >= 4) {
+              options = rawQ.options.slice(0, 4).map((opt: unknown) => String(opt ?? "").trim());
+            } else if (Array.isArray(rawQ.options)) {
               options = [
-                ...q.options.map((opt) => String(opt ?? "").trim()),
-                ...Array(Math.max(0, 4 - q.options.length)).fill(""),
+                ...rawQ.options.map((opt: unknown) => String(opt ?? "").trim()),
+                ...Array(Math.max(0, 4 - rawQ.options.length)).fill(""),
               ].slice(0, 4);
             } else {
               options = ["Option A", "Option B", "Option C", "Option D"];
             }
           }
 
-          let correctAnswer = String(q.correct_answer ?? "").trim();
+          // Normalize answer
+          let correctAnswer = String(rawQ.correct_answer ?? "").trim();
           if (type === "mcq") {
             const upper = correctAnswer.toUpperCase();
             if (["A", "B", "C", "D"].includes(upper)) {
               correctAnswer = upper;
             } else if (["1", "2", "3", "4"].includes(correctAnswer)) {
-              const map: Record<string, string> = {
-                "1": "A",
-                "2": "B",
-                "3": "C",
-                "4": "D",
-              };
+              const map: Record<string, string> = { "1": "A", "2": "B", "3": "C", "4": "D" };
               correctAnswer = map[correctAnswer] || "A";
             } else {
               correctAnswer = "A";
             }
           }
 
-          return {
-            id: `q-ext-${Date.now()}-${idx}`,
+          const newQ: EditableQuestion = {
+            id: `q-ext-${Date.now()}-${totalQuestionsFound}`,
             exam_id: examId,
             subject,
             type,
-            question_text: q.question_text || `Question ${idx + 1}`,
+            question_text: rawQ.question_text || `Question ${totalQuestionsFound}`,
             options,
             correct_answer: correctAnswer,
-            explanation: q.explanation || "",
-            positive_marks: q.positive_marks ?? defaultPosMarks,
-            negative_marks: q.negative_marks ?? defaultNegMarks,
+            explanation: rawQ.explanation || "",
+            positive_marks: rawQ.positive_marks ?? (exam?.positive_marks ?? 4),
+            negative_marks: rawQ.negative_marks ?? (exam?.negative_marks ?? 1),
+            image_url: diagramUrl,
+            has_diagram: !!diagramUrl || rawQ.has_diagram,
+            diagram_bbox: rawQ.diagram_bbox || null,
             isPreviewMode: true,
           };
-        }
-      );
 
-      setQuestions(extractedList);
+          allExtracted.push(newQ);
+          // Incrementally update UI so admin sees questions populating live!
+          setQuestions([...allExtracted]);
+        }
+      }
+
+      clearInterval(timerInterval);
+      setParseProgress(100);
+      setParseStatus("Extraction complete!");
+
+      if (allExtracted.length === 0) {
+        throw new Error("No questions were identified in the PDF pages.");
+      }
+
+      const diagramsExtracted = allExtracted.filter((q) => !!q.image_url).length;
       setSuccessMessage(
-        `Successfully extracted ${extractedList.length} questions in ${seconds}s with KaTeX math formatting!`
+        `Successfully extracted ${allExtracted.length} questions (${diagramsExtracted} with cropped diagrams) in ${seconds}s!`
       );
     } catch (err: unknown) {
       clearInterval(timerInterval);
@@ -600,6 +854,8 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
       explanation: "",
       positive_marks: exam?.positive_marks ?? 4,
       negative_marks: exam?.negative_marks ?? 1,
+      image_url: null,
+      has_diagram: false,
       isPreviewMode: false,
     };
     setQuestions((prev) => [newQ, ...prev]);
@@ -623,6 +879,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
     const mathematics = questions.filter((q) => q.subject === "mathematics").length;
     const mcq = questions.filter((q) => q.type === "mcq").length;
     const numerical = questions.filter((q) => q.type === "numerical").length;
+    const withDiagrams = questions.filter((q) => !!q.image_url).length;
     return {
       total: questions.length,
       physics,
@@ -630,6 +887,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
       mathematics,
       mcq,
       numerical,
+      withDiagrams,
     };
   }, [questions]);
 
@@ -655,11 +913,22 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
         positive_marks: q.positive_marks,
         negative_marks: q.negative_marks,
         order_index: idx + 1,
+        image_url: q.image_url || null,
       }));
 
-      const { error: insertError } = await supabase
+      let { error: insertError } = await supabase
         .from("questions")
         .insert(payload);
+
+      // Fallback if the remote questions table doesn't have image_url column yet
+      if (insertError && insertError.message.includes("image_url")) {
+        console.warn(
+          "Column 'image_url' not found in questions table. Falling back to insert without image_url."
+        );
+        const strippedPayload = payload.map(({ image_url, ...rest }) => rest);
+        const res = await supabase.from("questions").insert(strippedPayload);
+        insertError = res.error;
+      }
 
       if (insertError) {
         throw new Error(insertError.message);
@@ -695,6 +964,15 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
 
   return (
     <div className="space-y-6 pb-20">
+      {/* Hidden file input for manual diagram attachment/replacement */}
+      <input
+        ref={diagramFileInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={handleDiagramFileSelected}
+      />
+
       {/* Top Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800/80 pb-5">
         <div>
@@ -709,12 +987,12 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
             <span className="text-slate-700">•</span>
             <span className="text-xs font-semibold text-purple-400 flex items-center gap-1">
               <Sparkles className="w-3.5 h-3.5" />
-              Gemini AI PDF Importer
+              Gemini Vision & Diagram Importer
             </span>
           </div>
 
           <h1 className="text-xl sm:text-2xl font-black text-white tracking-tight flex items-center gap-2.5">
-            <span>AI Question Paper & Solution Importer</span>
+            <span>AI Question Paper & Diagram Importer</span>
           </h1>
           <p className="text-xs text-slate-400 mt-0.5">
             Target Exam:{" "}
@@ -838,13 +1116,13 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
                       {questionPdf.name}
                     </div>
                     <div className="text-[11px] text-emerald-400/80 mt-0.5">
-                      {(questionPdf.size / (1024 * 1024)).toFixed(2)} MB • Ready
+                      {(questionPdf.size / (1024 * 1024)).toFixed(2)} MB • Ready for High-Res Vision
                     </div>
                   </div>
                   <button
                     type="button"
                     onClick={() => setQuestionPdf(null)}
-                    className="inline-flex items-center gap-1 text-[11px] text-red-400 hover:text-red-300 transition"
+                    className="inline-flex items-center gap-1 text-[11px] text-red-400 hover:text-red-300 transition cursor-pointer"
                   >
                     <X className="w-3 h-3" />
                     <span>Remove File</span>
@@ -926,7 +1204,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
                   <button
                     type="button"
                     onClick={() => setSolutionPdf(null)}
-                    className="inline-flex items-center gap-1 text-[11px] text-red-400 hover:text-red-300 transition"
+                    className="inline-flex items-center gap-1 text-[11px] text-red-400 hover:text-red-300 transition cursor-pointer"
                   >
                     <X className="w-3 h-3" />
                     <span>Remove File</span>
@@ -962,7 +1240,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
         <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4">
           <div className="flex items-center gap-2 text-xs font-bold text-white uppercase tracking-wider">
             <Cpu className="w-4 h-4 text-purple-400" />
-            <span>Gemini Engine Settings</span>
+            <span>Gemini Vision Settings</span>
           </div>
 
           <div className="space-y-3">
@@ -971,7 +1249,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
                 <span>Gemini API Key</span>
                 <span className="text-[10px] text-slate-500 font-normal">
                   {process.env.NEXT_PUBLIC_GEMINI_API_KEY
-                    ? "NEXT_PUBLIC_GEMINI_API_KEY active as default"
+                    ? "NEXT_PUBLIC_GEMINI_API_KEY active"
                     : "Enter key or set NEXT_PUBLIC_GEMINI_API_KEY"}
                 </span>
               </label>
@@ -1002,16 +1280,13 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
                   className="w-full pl-3 pr-8 py-2 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs focus:outline-none focus:border-purple-500 appearance-none cursor-pointer transition"
                 >
                   <option value="gemini-3.8-flash">
-                    gemini-3.8-flash (Recommended • Streaming Fast)
+                    gemini-3.8-flash (Recommended • Vision + Auto-Cropping)
+                  </option>
+                  <option value="gemini-2.5-flash">
+                    gemini-2.5-flash (Reliable Fallback)
                   </option>
                   <option value="gemini-flash-latest">
                     gemini-flash-latest (General Fast)
-                  </option>
-                  <option value="gemini-3.1-flash-lite">
-                    gemini-3.1-flash-lite (Ultra Fast • Low Latency)
-                  </option>
-                  <option value="gemini-3.5-flash">
-                    gemini-3.5-flash (Gemini 3.5 Flash)
                   </option>
                 </select>
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -1032,7 +1307,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
               ) : (
                 <>
                   <Sparkles className="w-4 h-4 text-purple-200" />
-                  <span>Parse Question Paper with AI</span>
+                  <span>Parse Question Paper & Diagrams</span>
                 </>
               )}
             </button>
@@ -1080,7 +1355,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
               ({questionPdf ? (questionPdf.size / (1024 * 1024)).toFixed(2) : 0} MB)
             </span>
             <span className="text-cyan-400/80 font-medium">
-              Client-Side Direct Gemini Streaming • Zero Vercel Timeout
+              High-Res Page Vision (2.0x) • Auto Diagram Cropping • Batched Streaming
             </span>
           </div>
         </div>
@@ -1110,6 +1385,10 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
               <div className="px-3 py-1.5 rounded-xl bg-indigo-950/40 border border-indigo-800/40 text-indigo-300">
                 <span className="text-slate-400 mr-1.5">Mathematics:</span>
                 <span className="font-bold font-mono">{stats.mathematics}</span>
+              </div>
+              <div className="px-3 py-1.5 rounded-xl bg-purple-950/40 border border-purple-800/40 text-purple-300">
+                <span className="text-slate-400 mr-1.5">Diagrams:</span>
+                <span className="font-bold font-mono">{stats.withDiagrams}</span>
               </div>
             </div>
 
@@ -1293,6 +1572,76 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
                     )}
                   </div>
 
+                  {/* Diagram / Image Section */}
+                  <div className="pt-2 border-t border-slate-800/60">
+                    {q.image_url ? (
+                      <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <div className="relative w-28 h-20 rounded-lg overflow-hidden border border-slate-700 bg-slate-900 shrink-0 group">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={q.image_url}
+                              alt="Question Diagram"
+                              className="w-full h-full object-contain p-1"
+                            />
+                            <a
+                              href={q.image_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="absolute inset-0 bg-slate-950/70 opacity-0 group-hover:opacity-100 transition flex items-center justify-center text-white text-[11px] font-semibold gap-1"
+                              title="Open full diagram in new tab"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5" />
+                              <span>Full</span>
+                            </a>
+                          </div>
+                          <div>
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-purple-500/10 text-purple-300 border border-purple-500/20">
+                              <ImageIcon className="w-3 h-3" />
+                              Diagram Extracted
+                            </span>
+                            <p className="text-[11px] text-slate-400 mt-1 max-w-sm truncate font-mono">
+                              {q.image_url.split("/").pop()}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 self-end sm:self-center">
+                          <button
+                            type="button"
+                            onClick={() => triggerReplaceDiagram(q.id)}
+                            className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
+                            title="Replace diagram with another file"
+                          >
+                            <RotateCcw className="w-3 h-3 text-amber-400" />
+                            <span>Replace</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => updateQuestionField(q.id, "image_url", null)}
+                            className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-red-950/60 text-slate-300 hover:text-red-300 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
+                            title="Remove diagram from question"
+                          >
+                            <Trash2 className="w-3 h-3 text-red-400" />
+                            <span>Remove</span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-between text-xs py-0.5">
+                        <span className="text-[11px] text-slate-500">No diagram attached</span>
+                        <button
+                          type="button"
+                          onClick={() => triggerAddDiagram(q.id)}
+                          className="inline-flex items-center gap-1 text-[11px] text-purple-400 hover:text-purple-300 transition cursor-pointer"
+                        >
+                          <ImagePlus className="w-3.5 h-3.5" />
+                          <span>+ Add Diagram / Image</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
                   {/* Options (for MCQ) or Numerical Input */}
                   {q.type === "mcq" ? (
                     <div className="space-y-2 pt-2 border-t border-slate-800/60">
@@ -1426,7 +1775,7 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
               <span className="text-white font-bold font-mono">
                 {questions.length}
               </span>{" "}
-              questions to{" "}
+              questions ({stats.withDiagrams} diagrams) to{" "}
               <span className="text-purple-300 font-semibold">
                 {exam?.title}
               </span>

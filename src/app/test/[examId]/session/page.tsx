@@ -91,8 +91,17 @@ function QuestionArea({
         </div>
 
         {/* Question Statement */}
-        <div className="p-4 sm:p-5 rounded-2xl bg-slate-900/80 border border-slate-800 text-slate-100 text-sm sm:text-base leading-relaxed">
+        <div className="p-4 sm:p-5 rounded-2xl bg-slate-900/80 border border-slate-800 text-slate-100 text-sm sm:text-base leading-relaxed space-y-4">
           <MathView math={question.question_text} />
+          {question.image_url && (
+            <div className="pt-2">
+              <img
+                src={question.image_url}
+                alt="Question Diagram"
+                className="max-h-80 max-w-full rounded-xl border border-slate-800 bg-white/5 object-contain"
+              />
+            </div>
+          )}
         </div>
 
         {/* MCQ 4 Options */}
