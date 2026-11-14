@@ -1,22 +1,35 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { GoogleGenAI } from "@google/genai";
 
-export const maxDuration = 300; // 5 minutes timeout for large PDFs
+export const maxDuration = 60;
 
-interface ExtractedQuestion {
-  subject: "physics" | "chemistry" | "mathematics";
-  type: "mcq" | "numerical";
-  question_text: string;
-  options: string[] | null;
-  correct_answer: string;
-  explanation?: string | null;
-  positive_marks?: number;
-  negative_marks?: number;
-}
+async function fetchPdfBuffer(
+  url: string,
+  supabaseClient: Awaited<ReturnType<typeof createClient>>
+): Promise<Buffer> {
+  const res = await fetch(url);
+  if (res.ok) {
+    return Buffer.from(await res.arrayBuffer());
+  }
 
-interface GeminiExtractionResponse {
-  exam_title?: string;
-  questions: ExtractedQuestion[];
+  // Fallback: If bucket is private or direct fetch fails, download via supabase storage client
+  try {
+    const parts = url.split("/exam-pdfs/");
+    if (parts.length > 1) {
+      const storagePath = decodeURIComponent(parts[1].split("?")[0]);
+      const { data, error } = await supabaseClient.storage
+        .from("exam-pdfs")
+        .download(storagePath);
+      if (!error && data) {
+        return Buffer.from(await data.arrayBuffer());
+      }
+    }
+  } catch (err) {
+    console.warn("Storage download fallback failed:", err);
+  }
+
+  throw new Error(`Failed to fetch PDF from URL: ${url} (HTTP ${res.status})`);
 }
 
 export async function POST(
@@ -60,41 +73,36 @@ export async function POST(
       return NextResponse.json({ error: "Exam not found" }, { status: 404 });
     }
 
-    // 3. Parse Multipart Form Data
-    const formData = await req.formData();
-    const questionPaper = formData.get("questionPaper") as File | null;
-    const solutionPaper = formData.get("solutionPaper") as File | null;
-    const clientApiKey = (formData.get("apiKey") as string | null)?.trim();
-    const rawRequestedModel =
-      (formData.get("model") as string | null)?.trim() || "gemini-flash-latest";
-    const requestedModel = rawRequestedModel.replace(/^models\//, "");
-
-    if (!questionPaper) {
+    // 3. Parse JSON Body
+    let body: {
+      questionPdfUrl?: string;
+      solutionPdfUrl?: string | null;
+      apiKey?: string | null;
+    };
+    try {
+      body = await req.json();
+    } catch {
       return NextResponse.json(
-        { error: "Question paper PDF file is required." },
+        {
+          error:
+            "Invalid JSON request body. Expected { questionPdfUrl, solutionPdfUrl, apiKey }.",
+        },
         { status: 400 }
       );
     }
 
-    // Verify file size (< 20MB)
-    const MAX_FILE_SIZE = 20 * 1024 * 1024;
-    if (questionPaper.size > MAX_FILE_SIZE) {
+    const { questionPdfUrl, solutionPdfUrl, apiKey: clientApiKey } = body;
+
+    if (!questionPdfUrl) {
       return NextResponse.json(
-        { error: "Question paper exceeds the maximum 20MB file size limit." },
+        { error: "questionPdfUrl is required." },
         { status: 400 }
       );
     }
 
-    if (solutionPaper && solutionPaper.size > MAX_FILE_SIZE) {
-      return NextResponse.json(
-        { error: "Solution paper exceeds the maximum 20MB file size limit." },
-        { status: 400 }
-      );
-    }
-
-    // 4. Resolve Gemini API Key
+    // 4. Resolve Gemini API Key (no prefix rejection on AQ. or AIza)
     const apiKey =
-      clientApiKey ||
+      clientApiKey?.trim() ||
       process.env.GEMINI_API_KEY ||
       process.env.GOOGLE_API_KEY;
 
@@ -102,14 +110,14 @@ export async function POST(
       return NextResponse.json(
         {
           error:
-            "Gemini API Key is missing. Please provide your API key in the importer UI or set GEMINI_API_KEY in your server .env.local file.",
+            "Gemini API Key is missing. Please provide your API key in the importer UI or set GEMINI_API_KEY in your server environment.",
         },
         { status: 400 }
       );
     }
 
-    // 5. Convert PDFs to Base64
-    const qBuffer = Buffer.from(await questionPaper.arrayBuffer());
+    // 5. Fetch PDF(s) from Supabase URLs and convert to base64
+    const qBuffer = await fetchPdfBuffer(questionPdfUrl, supabase);
     const qBase64 = qBuffer.toString("base64");
 
     const parts: Array<
@@ -125,23 +133,28 @@ export async function POST(
     ];
 
     let solutionNote = "";
-    if (solutionPaper) {
-      const sBuffer = Buffer.from(await solutionPaper.arrayBuffer());
-      const sBase64 = sBuffer.toString("base64");
-      parts.push({
-        inlineData: {
-          mimeType: "application/pdf",
-          data: sBase64,
-        },
-      });
-      solutionNote =
-        "DOCUMENT 2 is the OFFICIAL SOLUTION & ANSWER KEY PAPER. Match each question from Document 1 with its corresponding official answer key and step-by-step solution from Document 2.";
-    } else {
+    if (solutionPdfUrl) {
+      try {
+        const sBuffer = await fetchPdfBuffer(solutionPdfUrl, supabase);
+        const sBase64 = sBuffer.toString("base64");
+        parts.push({
+          inlineData: {
+            mimeType: "application/pdf",
+            data: sBase64,
+          },
+        });
+        solutionNote =
+          "DOCUMENT 2 is the OFFICIAL SOLUTION & ANSWER KEY PAPER. Match each question from Document 1 with its corresponding official answer key and step-by-step solution from Document 2.";
+      } catch (sErr) {
+        console.warn("Failed to fetch optional solution PDF:", sErr);
+      }
+    }
+
+    if (!solutionNote) {
       solutionNote =
         "No separate solution paper is provided. Solve each question with complete accuracy, determine the correct answer, and provide a clear, step-by-step mathematical/conceptual solution.";
     }
 
-    // 6. Detailed Prompt for Gemini
     const systemPrompt = `You are an expert NTA JEE (Main) Question Paper Digitizer, LaTeX/KaTeX formatter, and academic examiner.
 Your task is to parse and extract ALL questions from the attached Question Paper PDF (Document 1).
 ${solutionNote}
@@ -192,256 +205,47 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
 
     parts.push({ text: systemPrompt });
 
-    // 7. Call Gemini REST API with robust endpoint & model fallback
-    // Prioritize models that are confirmed active and responsive for the API key
-    const fallbackModelList = [
-      requestedModel,
-      "gemini-flash-latest",
-      "gemini-3.1-flash-lite",
-      "gemini-3.5-flash",
-      "gemini-3.8-flash",
-      "gemini-2.5-flash",
-      "gemini-pro-latest",
-      "gemini-1.5-flash",
-    ];
+    // 6. Initialize GoogleGenAI and generateContentStream
+    const ai = new GoogleGenAI({ apiKey });
 
-    const candidateConfigs: Array<{ model: string; apiVersion: "v1beta" | "v1" }> = [];
-    for (const m of fallbackModelList) {
-      if (!m) continue;
-      const cleanM = m.replace(/^models\//, "");
-      candidateConfigs.push({ model: cleanM, apiVersion: "v1beta" });
-      candidateConfigs.push({ model: cleanM, apiVersion: "v1" });
-    }
-
-    // Deduplicate preserving order
-    const seen = new Set<string>();
-    const uniqueConfigs = candidateConfigs.filter((cfg) => {
-      const key = `${cfg.apiVersion}:${cfg.model}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+    const responseStream = await ai.models.generateContentStream({
+      model: "gemini-2.5-flash",
+      contents: parts,
+      config: {
+        responseMimeType: "application/json",
+        thinkingConfig: {
+          thinkingBudget: 0,
+        },
+      },
     });
 
-    let geminiResponseText: string | null = null;
-    let lastError: string = "Unknown error";
-
-    for (let i = 0; i < uniqueConfigs.length; i++) {
-      const { model, apiVersion } = uniqueConfigs[i];
-      try {
-        const endpoint = `https://generativelanguage.googleapis.com/${apiVersion}/models/${model}:generateContent?key=${apiKey}`;
-        
-        // Fast payload with zero thinking budget to eliminate reasoning overhead
-        const payloadWithZeroThinking: Record<string, unknown> = {
-          contents: [
-            {
-              role: "user",
-              parts,
-            },
-          ],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.1,
-            // Disable deep reasoning tokens to ensure fast extraction:
-            thinkingConfig: {
-              thinkingBudget: 0,
-            },
-          },
-        };
-
-        let res = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payloadWithZeroThinking),
-        });
-
-        // If the model does not support thinkingConfig and returns 400, retry once without it
-        if (!res.ok && res.status === 400) {
-          const errPeek = await res.clone().text();
-          if (
-            errPeek.toLowerCase().includes("thinking") ||
-            errPeek.toLowerCase().includes("unknown field")
-          ) {
-            const strippedPayload = {
-              contents: payloadWithZeroThinking.contents,
-              generationConfig: {
-                responseMimeType: "application/json",
-                temperature: 0.1,
-              },
-            };
-            res = await fetch(endpoint, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(strippedPayload),
-            });
-          }
-        }
-
-        if (!res.ok) {
-          const errorBody = await res.text();
-          let parsedError = errorBody;
-          try {
-            const errJson = JSON.parse(errorBody);
-            parsedError = errJson.error?.message || errorBody;
-          } catch {
-            // Keep text
-          }
-
-          // If 404 (model unavailable), 400 (bad request), 503 (high demand/overloaded), 429 (rate limit), or 500, fallback to next candidate
-          const isFallbackEligible =
-            res.status === 404 ||
-            res.status === 400 ||
-            res.status === 503 ||
-            res.status === 429 ||
-            res.status === 500;
-
-          if (isFallbackEligible && i < uniqueConfigs.length - 1) {
-            console.warn(`[Gemini Fallback] ${apiVersion}/models/${model} returned ${res.status}: ${parsedError}`);
-            lastError = `(${apiVersion}/${model}) ${parsedError}`;
-            continue;
-          }
-
-          throw new Error(`Gemini API Error (${res.status}): ${parsedError}`);
-        }
-
-        const data = await res.json();
-        const rawContent = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-        if (rawContent) {
-          geminiResponseText = rawContent;
-          break;
-        } else {
-          if (i < uniqueConfigs.length - 1) {
-            continue;
-          }
-          throw new Error("Gemini returned an empty candidate response.");
-        }
-      } catch (err: unknown) {
-        lastError = err instanceof Error ? err.message : String(err);
-        if (i === uniqueConfigs.length - 1) {
-          throw new Error(lastError);
-        }
-      }
-    }
-
-    if (!geminiResponseText) {
-      return NextResponse.json(
-        { error: `Failed to extract content: ${lastError}` },
-        { status: 500 }
-      );
-    }
-
-    // 8. Clean and parse JSON
-    let cleanedJson = geminiResponseText.trim();
-    if (cleanedJson.startsWith("```json")) {
-      cleanedJson = cleanedJson.replace(/^```json\s*/, "").replace(/```$/, "").trim();
-    } else if (cleanedJson.startsWith("```")) {
-      cleanedJson = cleanedJson.replace(/^```\s*/, "").replace(/```$/, "").trim();
-    }
-
-    let parsedResult: GeminiExtractionResponse;
-    try {
-      parsedResult = JSON.parse(cleanedJson);
-    } catch {
-      // Fallback: search for first { and last }
-      const firstBrace = cleanedJson.indexOf("{");
-      const lastBrace = cleanedJson.lastIndexOf("}");
-      if (firstBrace !== -1 && lastBrace !== -1) {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
         try {
-          parsedResult = JSON.parse(cleanedJson.substring(firstBrace, lastBrace + 1));
-        } catch (jsonErr: unknown) {
-          return NextResponse.json(
-            {
-              error:
-                "Failed to parse AI response into valid JSON: " +
-                (jsonErr instanceof Error ? jsonErr.message : String(jsonErr)),
-              raw: geminiResponseText.slice(0, 1000),
-            },
-            { status: 500 }
-          );
+          for await (const chunk of responseStream) {
+            const text = chunk.text;
+            if (text) {
+              controller.enqueue(encoder.encode(text));
+            }
+          }
+          controller.close();
+        } catch (err: unknown) {
+          console.error("Gemini stream error:", err);
+          controller.error(err);
         }
-      } else {
-        return NextResponse.json(
-          {
-            error: "Gemini did not return a valid JSON object structure.",
-            raw: geminiResponseText.slice(0, 1000),
-          },
-          { status: 500 }
-        );
-      }
-    }
-
-    if (!Array.isArray(parsedResult.questions)) {
-      return NextResponse.json(
-        { error: "AI response did not contain a 'questions' array.", raw: parsedResult },
-        { status: 500 }
-      );
-    }
-
-    // 9. Normalize & attach default marks
-    const defaultPosMarks = exam.positive_marks ?? 4;
-    const defaultNegMarks = exam.negative_marks ?? 1;
-
-    const normalizedQuestions = parsedResult.questions.map((q, index) => {
-      const subject = ["physics", "chemistry", "mathematics"].includes(
-        q.subject?.toLowerCase()
-      )
-        ? (q.subject.toLowerCase() as "physics" | "chemistry" | "mathematics")
-        : "physics";
-
-      const type = q.type?.toLowerCase() === "numerical" ? "numerical" : "mcq";
-
-      let options: string[] | null = null;
-      if (type === "mcq") {
-        if (Array.isArray(q.options) && q.options.length >= 4) {
-          options = q.options.slice(0, 4).map((opt) => String(opt ?? "").trim());
-        } else if (Array.isArray(q.options)) {
-          // Pad to 4 if model gave fewer
-          options = [
-            ...q.options.map((opt) => String(opt ?? "").trim()),
-            ...Array(Math.max(0, 4 - q.options.length)).fill(""),
-          ].slice(0, 4);
-        } else {
-          options = ["Option A", "Option B", "Option C", "Option D"];
-        }
-      }
-
-      let correctAnswer = String(q.correct_answer ?? "").trim();
-      if (type === "mcq") {
-        const upper = correctAnswer.toUpperCase();
-        if (["A", "B", "C", "D"].includes(upper)) {
-          correctAnswer = upper;
-        } else if (["1", "2", "3", "4"].includes(correctAnswer)) {
-          const map: Record<string, string> = { "1": "A", "2": "B", "3": "C", "4": "D" };
-          correctAnswer = map[correctAnswer] || "A";
-        } else {
-          correctAnswer = "A"; // default fallback
-        }
-      }
-
-      return {
-        id: `temp-${index + 1}`,
-        exam_id: examId,
-        subject,
-        type,
-        question_text: q.question_text || `Question ${index + 1}`,
-        options,
-        correct_answer: correctAnswer,
-        explanation: q.explanation || null,
-        positive_marks: q.positive_marks ?? defaultPosMarks,
-        negative_marks: q.negative_marks ?? defaultNegMarks,
-      };
+      },
     });
 
-    return NextResponse.json({
-      success: true,
-      exam_title: parsedResult.exam_title || exam.title,
-      total_extracted: normalizedQuestions.length,
-      questions: normalizedQuestions,
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Transfer-Encoding": "chunked",
+        "Cache-Control": "no-cache, no-transform",
+      },
     });
   } catch (error: unknown) {
-    console.error("PDF Parse error:", error);
+    console.error("PDF Parse route error:", error);
     return NextResponse.json(
       {
         error:
