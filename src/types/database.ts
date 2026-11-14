@@ -14,6 +14,7 @@ export interface Exam {
   is_active: boolean;
   created_at?: string;
   questions_count?: number;
+  submissions_count?: number;
 }
 
 export interface Question {
@@ -53,6 +54,26 @@ export interface CandidateAnswer {
   status: CandidateQuestionStatus;
 }
 
+export interface QuestionTelemetry {
+  question_id: string;
+  time_spent_sec: number;
+  visit_count: number;
+  first_visited_order?: number;
+  answer_switches?: number;
+  marked_for_review?: boolean;
+}
+
+export interface SubjectBreakdown {
+  subject: Subject;
+  score: number;
+  max_marks: number;
+  correct: number;
+  incorrect: number;
+  unattempted: number;
+  accuracy: number;
+  time_spent_sec: number;
+}
+
 export interface Submission {
   id: string;
   user_id: string;
@@ -62,7 +83,15 @@ export interface Submission {
   end_time?: string | null;
   total_score?: number | null;
   answers: Record<string, CandidateAnswer>;
+  question_telemetry?: Record<string, QuestionTelemetry> | null;
+  subject_breakdown?: {
+    physics?: SubjectBreakdown;
+    chemistry?: SubjectBreakdown;
+    mathematics?: SubjectBreakdown;
+    subject_visit_order?: string[];
+  } | null;
   created_at?: string;
   exams?: Exam;
+  profiles?: Profile;
 }
 

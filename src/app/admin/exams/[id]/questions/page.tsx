@@ -26,6 +26,7 @@ import {
   Clipboard,
   ExternalLink,
   FileEdit,
+  BarChart3,
 } from "lucide-react";
 
 async function uploadQuestionImageBlob(
@@ -586,6 +587,15 @@ function ExamQuestionsContent() {
             )}
             <span>{exam.is_active ? "Unpublish to Draft" : "Publish Exam"}</span>
           </button>
+
+          <Link
+            href={`/admin/exams/${examId}/analytics`}
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-cyan-400 hover:text-white font-semibold text-sm transition shadow-sm cursor-pointer"
+            title="View Candidate Scores, Leaderboard & Attempting Analytics"
+          >
+            <BarChart3 className="w-4 h-4 text-cyan-400" />
+            <span>Analytics & Results</span>
+          </Link>
 
           <Link
             href={`/admin/exams/${examId}/import`}

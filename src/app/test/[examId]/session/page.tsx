@@ -9,6 +9,8 @@ import type {
   Subject,
   CandidateQuestionStatus,
   CandidateAnswer,
+  QuestionTelemetry,
+  SubjectBreakdown,
 } from "@/types/database";
 import MathView from "@/components/MathView";
 import {
@@ -261,6 +263,57 @@ function ExamSessionContent() {
 
   const isFinalizing = useRef(false);
 
+  // Granular Question & Subject Telemetry Refs (No extra re-renders per second)
+  const telemetryRef = useRef<Record<string, QuestionTelemetry>>({});
+  const activeQuestionIdRef = useRef<string | null>(null);
+  const activeQuestionStartRef = useRef<number>(Date.now());
+  const visitOrderCounterRef = useRef<number>(1);
+  const subjectVisitOrderRef = useRef<string[]>([]);
+
+  const flushActiveQuestionTime = useCallback(() => {
+    const qId = activeQuestionIdRef.current;
+    if (qId && activeQuestionStartRef.current) {
+      const elapsed = Math.max(0, Math.round((Date.now() - activeQuestionStartRef.current) / 1000));
+      if (elapsed > 0) {
+        if (!telemetryRef.current[qId]) {
+          telemetryRef.current[qId] = {
+            question_id: qId,
+            time_spent_sec: 0,
+            visit_count: 1,
+            first_visited_order: visitOrderCounterRef.current++,
+            answer_switches: 0,
+            marked_for_review: false,
+          };
+        }
+        telemetryRef.current[qId].time_spent_sec =
+          (telemetryRef.current[qId].time_spent_sec || 0) + elapsed;
+      }
+      activeQuestionStartRef.current = Date.now();
+    }
+  }, []);
+
+  const activateQuestionTelemetry = useCallback(
+    (qId: string) => {
+      flushActiveQuestionTime();
+
+      if (!telemetryRef.current[qId]) {
+        telemetryRef.current[qId] = {
+          question_id: qId,
+          time_spent_sec: 0,
+          visit_count: 0,
+          first_visited_order: visitOrderCounterRef.current++,
+          answer_switches: 0,
+          marked_for_review: false,
+        };
+      }
+
+      telemetryRef.current[qId].visit_count = (telemetryRef.current[qId].visit_count || 0) + 1;
+      activeQuestionIdRef.current = qId;
+      activeQuestionStartRef.current = Date.now();
+    },
+    [flushActiveQuestionTime]
+  );
+
   // Load Exam, Questions, and existing Submission
   useEffect(() => {
     let ignore = false;
@@ -317,6 +370,17 @@ function ExamSessionContent() {
             setCandidateAnswers(subData.answers as Record<string, CandidateAnswer>);
           }
 
+          if (subData?.question_telemetry && typeof subData.question_telemetry === "object") {
+            telemetryRef.current = { ...(subData.question_telemetry as Record<string, QuestionTelemetry>) };
+          }
+
+          if (
+            subData?.subject_breakdown?.subject_visit_order &&
+            Array.isArray(subData.subject_breakdown.subject_visit_order)
+          ) {
+            subjectVisitOrderRef.current = [...subData.subject_breakdown.subject_visit_order];
+          }
+
           if (subData?.start_time && examData) {
             const elapsedSeconds = Math.floor(
               (new Date().getTime() - new Date(subData.start_time).getTime()) / 1000
@@ -346,6 +410,39 @@ function ExamSessionContent() {
   }, [questions, activeSubject]);
 
   const currentQuestion = sectionQuestions[currentQuestionIndex] ?? null;
+
+  // Track telemetry on question change
+  useEffect(() => {
+    if (currentQuestion) {
+      activateQuestionTelemetry(currentQuestion.id);
+    }
+  }, [currentQuestion?.id, activateQuestionTelemetry]);
+
+  // Track subject transition sequence
+  useEffect(() => {
+    if (activeSubject) {
+      const list = subjectVisitOrderRef.current;
+      if (list.length === 0 || list[list.length - 1] !== activeSubject) {
+        list.push(activeSubject);
+      }
+    }
+  }, [activeSubject]);
+
+  // Track visibility change (tab switching)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        flushActiveQuestionTime();
+      } else {
+        activeQuestionStartRef.current = Date.now();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      flushActiveQuestionTime();
+    };
+  }, [flushActiveQuestionTime]);
 
   // Mark current question as not_answered if it was not_visited
   const selectQuestion = useCallback(
@@ -400,6 +497,8 @@ function ExamSessionContent() {
         return;
       }
 
+      flushActiveQuestionTime();
+
       let calculatedScore = 0;
       questions.forEach((q) => {
         const candidateResp = candidateAnswers[q.id];
@@ -425,16 +524,116 @@ function ExamSessionContent() {
         }
       });
 
-      await supabase
+      // Compute granular per-subject breakdown
+      const subjects: Subject[] = ["physics", "chemistry", "mathematics"];
+      const subjectBreakdownData: Record<string, any> = {
+        subject_visit_order: subjectVisitOrderRef.current,
+      };
+
+      subjects.forEach((subj) => {
+        const subjQuestions = questions.filter((q) => q.subject === subj);
+        let score = 0;
+        let correct = 0;
+        let incorrect = 0;
+        let unattempted = 0;
+        let timeSpent = 0;
+        let maxMarks = 0;
+
+        subjQuestions.forEach((q) => {
+          maxMarks += q.positive_marks ?? 4;
+          const t = telemetryRef.current[q.id];
+          if (t) timeSpent += t.time_spent_sec || 0;
+
+          const candidateResp = candidateAnswers[q.id];
+          const isAttempted =
+            candidateResp &&
+            (candidateResp.status === "answered" ||
+              candidateResp.status === "answered_and_marked_for_review") &&
+            Boolean(candidateResp.selected_answer);
+
+          if (isAttempted && candidateResp.selected_answer) {
+            const isCorrect =
+              q.type === "mcq"
+                ? candidateResp.selected_answer.trim().toUpperCase() ===
+                  q.correct_answer.trim().toUpperCase()
+                : candidateResp.selected_answer.trim() === q.correct_answer.trim();
+
+            if (isCorrect) {
+              correct++;
+              score += q.positive_marks ?? 4;
+            } else {
+              incorrect++;
+              if (exam.has_negative_marking) {
+                score -= q.negative_marks ?? 1;
+              }
+            }
+          } else {
+            unattempted++;
+          }
+        });
+
+        const accuracy =
+          correct + incorrect > 0
+            ? Math.round((correct / (correct + incorrect)) * 1000) / 10
+            : 0;
+
+        subjectBreakdownData[subj] = {
+          subject: subj,
+          score,
+          max_marks: maxMarks,
+          correct,
+          incorrect,
+          unattempted,
+          accuracy,
+          time_spent_sec: timeSpent,
+        };
+      });
+
+      const updatePayload: Record<string, any> = {
+        status: "completed",
+        end_time: new Date().toISOString(),
+        total_score: calculatedScore,
+        answers: candidateAnswers,
+        question_telemetry: telemetryRef.current,
+        subject_breakdown: subjectBreakdownData,
+      };
+
+      let { error: subUpdateError } = await supabase
         .from("submissions")
-        .update({
-          status: "completed",
-          end_time: new Date().toISOString(),
-          total_score: calculatedScore,
-          answers: candidateAnswers,
-        })
+        .update(updatePayload)
         .eq("user_id", userId)
         .eq("exam_id", examId);
+
+      // Safe fallback if telemetry columns not yet created in remote DB
+      if (
+        subUpdateError &&
+        (subUpdateError.message.includes("question_telemetry") ||
+          subUpdateError.message.includes("subject_breakdown"))
+      ) {
+        console.warn(
+          "Columns not found in submissions table, saving without telemetry:",
+          subUpdateError.message
+        );
+        const { question_telemetry, subject_breakdown, ...fallbackPayload } = updatePayload;
+        await supabase
+          .from("submissions")
+          .update(fallbackPayload)
+          .eq("user_id", userId)
+          .eq("exam_id", examId);
+      }
+
+      // LocalStorage cache for instant results view
+      try {
+        localStorage.setItem(
+          `cbt_telemetry_${examId}_${userId}`,
+          JSON.stringify({
+            question_telemetry: telemetryRef.current,
+            subject_breakdown: subjectBreakdownData,
+          })
+        );
+      } catch (e) {
+        console.warn("Could not cache telemetry in localStorage:", e);
+      }
 
       router.push(`/test/${examId}/result`);
     } catch (err) {
@@ -443,7 +642,16 @@ function ExamSessionContent() {
     } finally {
       setIsSubmitting(false);
     }
-  }, [userId, examId, exam, questions, candidateAnswers, supabase, router]);
+  }, [
+    userId,
+    examId,
+    exam,
+    questions,
+    candidateAnswers,
+    supabase,
+    router,
+    flushActiveQuestionTime,
+  ]);
 
   // Countdown Timer
   useEffect(() => {
@@ -478,8 +686,34 @@ function ExamSessionContent() {
   };
 
   // Action helpers called from QuestionArea
+  const recordAnswerTelemetry = (
+    qId: string,
+    answer: string | null,
+    isMarkedForReview: boolean
+  ) => {
+    const prevAnswer = candidateAnswers[qId]?.selected_answer;
+    if (!telemetryRef.current[qId]) {
+      telemetryRef.current[qId] = {
+        question_id: qId,
+        time_spent_sec: 0,
+        visit_count: 1,
+        first_visited_order: visitOrderCounterRef.current++,
+        answer_switches: 0,
+        marked_for_review: false,
+      };
+    }
+    if (prevAnswer && answer && prevAnswer !== answer) {
+      telemetryRef.current[qId].answer_switches =
+        (telemetryRef.current[qId].answer_switches || 0) + 1;
+    }
+    if (isMarkedForReview) {
+      telemetryRef.current[qId].marked_for_review = true;
+    }
+  };
+
   const handleSaveAndNext = (answer: string | null) => {
     if (!currentQuestion) return;
+    recordAnswerTelemetry(currentQuestion.id, answer, false);
     const newStatus: CandidateQuestionStatus = answer ? "answered" : "not_answered";
     const updated = {
       ...candidateAnswers,
@@ -499,6 +733,7 @@ function ExamSessionContent() {
 
   const handleSaveAndMarkForReview = (answer: string | null) => {
     if (!currentQuestion) return;
+    recordAnswerTelemetry(currentQuestion.id, answer, true);
     const newStatus: CandidateQuestionStatus = answer
       ? "answered_and_marked_for_review"
       : "marked_for_review";
@@ -522,6 +757,7 @@ function ExamSessionContent() {
   const handleMarkForReviewAndNext = () => {
     if (!currentQuestion) return;
     const existing = candidateAnswers[currentQuestion.id]?.selected_answer ?? null;
+    recordAnswerTelemetry(currentQuestion.id, existing, true);
     const newStatus: CandidateQuestionStatus = existing
       ? "answered_and_marked_for_review"
       : "marked_for_review";
@@ -544,6 +780,11 @@ function ExamSessionContent() {
 
   const handleClearResponse = () => {
     if (!currentQuestion) return;
+    const prevAnswer = candidateAnswers[currentQuestion.id]?.selected_answer;
+    if (prevAnswer && telemetryRef.current[currentQuestion.id]) {
+      telemetryRef.current[currentQuestion.id].answer_switches =
+        (telemetryRef.current[currentQuestion.id].answer_switches || 0) + 1;
+    }
     const clearStatus: CandidateQuestionStatus = "not_answered";
     const updated: Record<string, CandidateAnswer> = {
       ...candidateAnswers,

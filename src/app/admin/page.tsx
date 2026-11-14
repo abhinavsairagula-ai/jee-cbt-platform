@@ -19,6 +19,8 @@ import {
   Sparkles,
   RefreshCw,
   FileEdit,
+  BarChart3,
+  Users,
 } from "lucide-react";
 
 export default function AdminDashboardPage() {
@@ -45,16 +47,23 @@ export default function AdminDashboardPage() {
           console.warn("Exams query:", examsError.message);
           setExams([]);
         } else {
-          // For each exam, query the questions count
+          // For each exam, query the questions and submissions count
           const examsWithCounts = await Promise.all(
             (examsData || []).map(async (exam) => {
-              const { count } = await supabase
-                .from("questions")
-                .select("*", { count: "exact", head: true })
-                .eq("exam_id", exam.id);
+              const [{ count: qCount }, { count: sCount }] = await Promise.all([
+                supabase
+                  .from("questions")
+                  .select("*", { count: "exact", head: true })
+                  .eq("exam_id", exam.id),
+                supabase
+                  .from("submissions")
+                  .select("*", { count: "exact", head: true })
+                  .eq("exam_id", exam.id),
+              ]);
               return {
                 ...exam,
-                questions_count: count ?? 0,
+                questions_count: qCount ?? 0,
+                submissions_count: sCount ?? 0,
               };
             })
           );
@@ -84,13 +93,20 @@ export default function AdminDashboardPage() {
           } else {
             const examsWithCounts = await Promise.all(
               (examsData || []).map(async (exam) => {
-                const { count } = await supabase
-                  .from("questions")
-                  .select("*", { count: "exact", head: true })
-                  .eq("exam_id", exam.id);
+                const [{ count: qCount }, { count: sCount }] = await Promise.all([
+                  supabase
+                    .from("questions")
+                    .select("*", { count: "exact", head: true })
+                    .eq("exam_id", exam.id),
+                  supabase
+                    .from("submissions")
+                    .select("*", { count: "exact", head: true })
+                    .eq("exam_id", exam.id),
+                ]);
                 return {
                   ...exam,
-                  questions_count: count ?? 0,
+                  questions_count: qCount ?? 0,
+                  submissions_count: sCount ?? 0,
                 };
               })
             );
@@ -319,9 +335,20 @@ export default function AdminDashboardPage() {
                     )}
                   </span>
 
-                  <span className="text-xs text-slate-500 font-mono">
-                    {exam.questions_count ?? 0} Questions
-                  </span>
+                  <div className="flex items-center gap-2 text-xs font-mono">
+                    <span className="text-slate-500">
+                      {exam.questions_count ?? 0} Qs
+                    </span>
+                    {(exam.submissions_count ?? 0) > 0 && (
+                      <span
+                        className="px-2 py-0.5 rounded-md bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 flex items-center gap-1 font-semibold"
+                        title="Candidate submissions"
+                      >
+                        <Users className="w-3 h-3" />
+                        {exam.submissions_count} {exam.submissions_count === 1 ? "Attempt" : "Attempts"}
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {/* Title & Description */}
@@ -357,10 +384,24 @@ export default function AdminDashboardPage() {
               <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
                 <Link
                   href={`/admin/exams/${exam.id}/questions`}
-                  className="flex-1 min-w-[130px] inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-blue-600/10 hover:bg-blue-600 text-blue-400 hover:text-white border border-blue-500/20 text-xs font-semibold transition cursor-pointer"
+                  className="flex-1 min-w-[120px] inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-blue-600/10 hover:bg-blue-600 text-blue-400 hover:text-white border border-blue-500/20 text-xs font-semibold transition cursor-pointer"
                 >
                   <Settings2 className="w-3.5 h-3.5" />
-                  <span>Manage Questions</span>
+                  <span>Questions</span>
+                </Link>
+
+                <Link
+                  href={`/admin/exams/${exam.id}/analytics`}
+                  className="inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-cyan-500/10 hover:bg-cyan-600 text-cyan-400 hover:text-white border border-cyan-500/20 text-xs font-semibold transition cursor-pointer"
+                  title="View Candidate Scores, Leaderboard & Attempting Analytics"
+                >
+                  <BarChart3 className="w-3.5 h-3.5" />
+                  <span>Analytics</span>
+                  {(exam.submissions_count ?? 0) > 0 && (
+                    <span className="ml-0.5 px-1.5 py-0.2 rounded-full text-[10px] bg-cyan-500/20 text-cyan-300 font-mono font-bold">
+                      {exam.submissions_count}
+                    </span>
+                  )}
                 </Link>
 
                 <button
@@ -380,12 +421,12 @@ export default function AdminDashboardPage() {
                   {exam.is_active ? (
                     <>
                       <FileEdit className="w-3.5 h-3.5 text-amber-400" />
-                      <span>Move to Draft</span>
+                      <span>Draft</span>
                     </>
                   ) : (
                     <>
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Publish Test</span>
+                      <span>Publish</span>
                     </>
                   )}
                 </button>
