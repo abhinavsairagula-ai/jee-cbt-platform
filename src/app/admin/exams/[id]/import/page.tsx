@@ -8,7 +8,7 @@ import { safeParseJson } from "@/lib/json-repair";
 import { GoogleGenAI } from "@google/genai";
 import * as pdfjsLib from "pdfjs-dist";
 import type { Exam, Subject, QuestionType } from "@/types/database";
-import MathView from "@/components/MathView";
+import MathView, { sanitizeMathProse } from "@/components/MathView";
 import {
   ArrowLeft,
   UploadCloud,
@@ -32,6 +32,9 @@ import {
   ImagePlus,
   ExternalLink,
   RotateCcw,
+  Crop,
+  Sliders,
+  Check,
 } from "lucide-react";
 
 // Configure pdfjs worker for client-side rendering
@@ -52,6 +55,7 @@ interface EditableQuestion {
   negative_marks: number;
   image_url?: string | null;
   has_diagram?: boolean;
+  diagram_page?: number | null;
   diagram_bbox?: [number, number, number, number] | null;
   isPreviewMode?: boolean;
 }
@@ -118,10 +122,11 @@ function formatGeminiErrorMessage(err: unknown): string {
   return String(err);
 }
 
-// Crop bounding box from high-res canvas with padding
+// Crop bounding box from high-res canvas with padding (default 42px)
 async function cropDiagramToBlob(
   canvas: HTMLCanvasElement,
-  bbox: [number, number, number, number]
+  bbox: [number, number, number, number],
+  customPad: number = 42
 ): Promise<Blob | null> {
   try {
     const [ymin, xmin, ymax, xmax] = bbox;
@@ -136,8 +141,8 @@ async function cropDiagramToBlob(
     let x2 = (xmax / 1000) * cW;
     let y2 = (ymax / 1000) * cH;
 
-    // Add 16px padding
-    const pad = 16;
+    // Default 42px padding so outer atom labels, axes, and (a)/(b) captions below diagrams are never cut off
+    const pad = customPad;
     x1 = Math.max(0, Math.floor(x1 - pad));
     y1 = Math.max(0, Math.floor(y1 - pad));
     x2 = Math.min(cW, Math.ceil(x2 + pad));
@@ -653,6 +658,253 @@ function PdfImportContent() {
   // Saving state
   const [isSaving, setIsSaving] = useState(false);
 
+  // Canvas caching for instant re-crops and manual crop tool
+  const renderedCanvasesRef = useRef<HTMLCanvasElement[]>([]);
+  const [renderedPageCount, setRenderedPageCount] = useState(0);
+
+  // Interactive Adjust / Manual Crop Modal State
+  interface CropModalState {
+    isOpen: boolean;
+    questionId: string;
+    pageNumber: number; // 1-indexed (1 to renderedPageCount)
+    bbox: [number, number, number, number]; // [ymin, xmin, ymax, xmax] 0-1000
+    isSaving: boolean;
+  }
+  const [cropModal, setCropModal] = useState<CropModalState>({
+    isOpen: false,
+    questionId: "",
+    pageNumber: 1,
+    bbox: [150, 100, 600, 900],
+    isSaving: false,
+  });
+
+  const cropPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pageOverviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const isDraggingCropRef = useRef(false);
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  const ensureCanvasesLoaded = async (): Promise<HTMLCanvasElement[]> => {
+    if (renderedCanvasesRef.current.length > 0) {
+      return renderedCanvasesRef.current;
+    }
+    if (!questionPdf) return [];
+
+    try {
+      const qArrayBuffer = await questionPdf.arrayBuffer();
+      const pdfDoc = await pdfjsLib.getDocument({ data: qArrayBuffer }).promise;
+      const numPages = pdfDoc.numPages;
+      const canvases: HTMLCanvasElement[] = [];
+
+      for (let p = 1; p <= numPages; p++) {
+        const page = await pdfDoc.getPage(p);
+        const viewport = page.getViewport({ scale: 2.0 });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.floor(viewport.width);
+        canvas.height = Math.floor(viewport.height);
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+          canvases.push(canvas);
+        }
+      }
+
+      renderedCanvasesRef.current = canvases;
+      setRenderedPageCount(canvases.length);
+      return canvases;
+    } catch (err) {
+      console.warn("Failed to load canvases on demand:", err);
+      return [];
+    }
+  };
+
+  const openAdjustCropModal = async (q: EditableQuestion) => {
+    const canvases = await ensureCanvasesLoaded();
+    const maxPage = canvases.length || renderedPageCount || 1;
+    let defaultPage = q.diagram_page || 1;
+    if (defaultPage < 1 || defaultPage > maxPage) {
+      defaultPage = 1;
+    }
+
+    const defaultBbox: [number, number, number, number] =
+      Array.isArray(q.diagram_bbox) && q.diagram_bbox.length === 4
+        ? [q.diagram_bbox[0], q.diagram_bbox[1], q.diagram_bbox[2], q.diagram_bbox[3]]
+        : [150, 100, 600, 900];
+
+    setCropModal({
+      isOpen: true,
+      questionId: q.id,
+      pageNumber: defaultPage,
+      bbox: defaultBbox,
+      isSaving: false,
+    });
+  };
+
+  const nudgeCrop = (
+    edge: "top" | "bottom" | "left" | "right",
+    delta: number
+  ) => {
+    setCropModal((prev) => {
+      let [ymin, xmin, ymax, xmax] = prev.bbox;
+      if (edge === "top") ymin = Math.max(0, Math.min(ymax - 20, ymin + delta));
+      if (edge === "bottom") ymax = Math.min(1000, Math.max(ymin + 20, ymax + delta));
+      if (edge === "left") xmin = Math.max(0, Math.min(xmax - 20, xmin + delta));
+      if (edge === "right") xmax = Math.min(1000, Math.max(xmin + 20, xmax + delta));
+      return { ...prev, bbox: [ymin, xmin, ymax, xmax] };
+    });
+  };
+
+  const expandAllEdges = (amount: number) => {
+    setCropModal((prev) => {
+      let [ymin, xmin, ymax, xmax] = prev.bbox;
+      ymin = Math.max(0, ymin - amount);
+      xmin = Math.max(0, xmin - amount);
+      ymax = Math.min(1000, ymax + amount);
+      xmax = Math.min(1000, xmax + amount);
+      return { ...prev, bbox: [ymin, xmin, ymax, xmax] };
+    });
+  };
+
+  const handleSaveAdjustedCrop = async () => {
+    if (!cropModal.questionId) return;
+    const q = questions.find((item) => item.id === cropModal.questionId);
+    if (!q) return;
+
+    setCropModal((prev) => ({ ...prev, isSaving: true }));
+    try {
+      const canvases = await ensureCanvasesLoaded();
+      const targetCanvas = canvases[cropModal.pageNumber - 1];
+      if (!targetCanvas) {
+        throw new Error(`Page ${cropModal.pageNumber} canvas is not available.`);
+      }
+
+      // Crop with 10px custom padding because user specifically positioned the box
+      const blob = await cropDiagramToBlob(targetCanvas, cropModal.bbox, 10);
+      if (!blob) throw new Error("Could not extract cropped diagram from canvas.");
+
+      const qIndex = questions.findIndex((item) => item.id === cropModal.questionId) + 1;
+      const uploadedUrl = await uploadDiagramBlob(supabase, examId, qIndex, blob);
+
+      if (!uploadedUrl) {
+        throw new Error("Failed to upload cropped diagram to storage.");
+      }
+
+      updateQuestionField(q.id, "image_url", uploadedUrl);
+      updateQuestionField(q.id, "has_diagram", true);
+      updateQuestionField(q.id, "diagram_page", cropModal.pageNumber);
+      updateQuestionField(q.id, "diagram_bbox", cropModal.bbox);
+
+      setCropModal((prev) => ({ ...prev, isOpen: false, isSaving: false }));
+    } catch (err) {
+      console.error("Save adjusted crop error:", err);
+      setErrorMessage(
+        err instanceof Error ? err.message : "Failed to save adjusted crop."
+      );
+      setCropModal((prev) => ({ ...prev, isSaving: false }));
+    }
+  };
+
+  const handleOverviewMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = pageOverviewCanvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const clickX = ((e.clientX - rect.left) / rect.width) * 1000;
+    const clickY = ((e.clientY - rect.top) / rect.height) * 1000;
+
+    isDraggingCropRef.current = true;
+    dragStartRef.current = { x: clickX, y: clickY };
+  };
+
+  const handleOverviewMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isDraggingCropRef.current || !dragStartRef.current) return;
+    const canvas = pageOverviewCanvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const curX = Math.max(0, Math.min(1000, ((e.clientX - rect.left) / rect.width) * 1000));
+    const curY = Math.max(0, Math.min(1000, ((e.clientY - rect.top) / rect.height) * 1000));
+
+    const xmin = Math.round(Math.min(dragStartRef.current.x, curX));
+    const xmax = Math.round(Math.max(dragStartRef.current.x, curX));
+    const ymin = Math.round(Math.min(dragStartRef.current.y, curY));
+    const ymax = Math.round(Math.max(dragStartRef.current.y, curY));
+
+    if (xmax - xmin > 10 && ymax - ymin > 10) {
+      setCropModal((prev) => ({
+        ...prev,
+        bbox: [ymin, xmin, ymax, xmax],
+      }));
+    }
+  };
+
+  const handleOverviewMouseUp = () => {
+    isDraggingCropRef.current = false;
+    dragStartRef.current = null;
+  };
+
+  useEffect(() => {
+    if (!cropModal.isOpen) return;
+
+    const canvases = renderedCanvasesRef.current;
+    const targetCanvas = canvases[cropModal.pageNumber - 1];
+    if (!targetCanvas) return;
+
+    // 1. Render Overview Canvas with dark overlay and cyan bounding box
+    const overviewCanvas = pageOverviewCanvasRef.current;
+    if (overviewCanvas) {
+      overviewCanvas.width = targetCanvas.width;
+      overviewCanvas.height = targetCanvas.height;
+      const ctx = overviewCanvas.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(targetCanvas, 0, 0);
+
+        const [ymin, xmin, ymax, xmax] = cropModal.bbox;
+        const x1 = (xmin / 1000) * targetCanvas.width;
+        const y1 = (ymin / 1000) * targetCanvas.height;
+        const w = ((xmax - xmin) / 1000) * targetCanvas.width;
+        const h = ((ymax - ymin) / 1000) * targetCanvas.height;
+
+        // Dark shaded mask outside the crop box
+        ctx.fillStyle = "rgba(15, 23, 42, 0.65)";
+        ctx.fillRect(0, 0, targetCanvas.width, y1);
+        ctx.fillRect(0, y1 + h, targetCanvas.width, targetCanvas.height - (y1 + h));
+        ctx.fillRect(0, y1, x1, h);
+        ctx.fillRect(x1 + w, y1, targetCanvas.width - (x1 + w), h);
+
+        // Crop bounding box stroke
+        ctx.strokeStyle = "#38bdf8";
+        ctx.lineWidth = 4;
+        ctx.strokeRect(x1, y1, w, h);
+
+        // Corner handles
+        const handleSize = 14;
+        ctx.fillStyle = "#38bdf8";
+        ctx.fillRect(x1 - handleSize / 2, y1 - handleSize / 2, handleSize, handleSize);
+        ctx.fillRect(x1 + w - handleSize / 2, y1 - handleSize / 2, handleSize, handleSize);
+        ctx.fillRect(x1 - handleSize / 2, y1 + h - handleSize / 2, handleSize, handleSize);
+        ctx.fillRect(x1 + w - handleSize / 2, y1 + h - handleSize / 2, handleSize, handleSize);
+      }
+    }
+
+    // 2. Render Crop Preview Canvas
+    const previewCanvas = cropPreviewCanvasRef.current;
+    if (previewCanvas) {
+      const [ymin, xmin, ymax, xmax] = cropModal.bbox;
+      const x1 = Math.max(0, Math.floor((xmin / 1000) * targetCanvas.width));
+      const y1 = Math.max(0, Math.floor((ymin / 1000) * targetCanvas.height));
+      const x2 = Math.min(targetCanvas.width, Math.ceil((xmax / 1000) * targetCanvas.width));
+      const y2 = Math.min(targetCanvas.height, Math.ceil((ymax / 1000) * targetCanvas.height));
+      const w = Math.max(1, x2 - x1);
+      const h = Math.max(1, y2 - y1);
+
+      previewCanvas.width = w;
+      previewCanvas.height = h;
+      const pCtx = previewCanvas.getContext("2d");
+      if (pCtx) {
+        pCtx.clearRect(0, 0, w, h);
+        pCtx.drawImage(targetCanvas, x1, y1, w, h, 0, 0, w, h);
+      }
+    }
+  }, [cropModal.isOpen, cropModal.pageNumber, cropModal.bbox, renderedPageCount]);
+
   // Load Exam Details
   useEffect(() => {
     let ignore = false;
@@ -864,6 +1116,10 @@ function PdfImportContent() {
         pageJpegs.push(base64);
       }
 
+      // Persist canvases for live crop adjustment & manual cropping
+      renderedCanvasesRef.current = pageCanvases;
+      setRenderedPageCount(pageCanvases.length);
+
       // Render Solution / Answer Key PDF pages if uploaded
       const solutionPageJpegs: string[] = [];
       if (solutionPdf) {
@@ -937,7 +1193,8 @@ CRITICAL INSTRUCTIONS:
    - If YES:
      - Set "has_diagram": true
      - Set "diagram_page": 1 if the diagram is on the 1st image in this batch, 2 if on the 2nd image.
-     - Set "diagram_bbox": [ymin, xmin, ymax, xmax] as normalized integer coordinates from 0 to 1000 tightly enclosing ONLY the diagram/figure/graph. DO NOT include question statement text or options in the bounding box.
+     - Set "diagram_bbox": [ymin, xmin, ymax, xmax] as normalized integer coordinates from 0 to 1000 tightly enclosing the entire figure.
+     - MULTI-SUBFIGURE RULE: If a question contains multiple side-by-side or stacked sub-diagrams (e.g., structures (a) and (b), circuits (i) and (ii)), "diagram_bbox" MUST enclose ALL sub-figures together in one unified bounding box, INCLUDING any "(a)", "(b)", "(i)", "(ii)" labels printed below or beside them, and extending slightly past outer chemical bonds/atoms/arrows. EXCLUDE surrounding question text lines like "Statement-I:" or "Statement-II:" above the figure.
    - If NO diagram:
      - Set "has_diagram": false
      - Set "diagram_page": null
@@ -946,6 +1203,7 @@ CRITICAL INSTRUCTIONS:
 4. LATEX & ESCAPING (CRITICAL):
    - Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta, \\sqrt, \\alpha) so the output is 100% valid JSON.
    - Wrap inline math in '$...$' and display math in '$$...$$'.
+   - NEVER output raw placeholding strings like "(a) Image", "(b) Image", or "[Image]" in "question_text". Instead, use natural phrasing like "Refer to structures (a) and (b) in the figure:" or simply describe the problem statement clearly.
 
 5. MCQ OPTIONS & CORRECT ANSWER:
    - For 'mcq', 'options' MUST be an array of EXACTLY 4 strings: [Option A, Option B, Option C, Option D] without leading labels like "(A)".
@@ -1056,6 +1314,7 @@ ${batchPromptTemplate}`,
           totalQuestionsFound++;
 
           let diagramUrl: string | null = null;
+          let targetPageNum: number = batchPages[0] || 1;
 
           // If question has a diagram, crop from corresponding canvas and upload
           if (
@@ -1070,13 +1329,15 @@ ${batchPromptTemplate}`,
             let targetCanvas: HTMLCanvasElement | null = null;
             if (typeof rawQ.diagram_page === "number") {
               if (rawQ.diagram_page >= 1 && rawQ.diagram_page <= batchPages.length) {
-                const pgNum = batchPages[rawQ.diagram_page - 1];
-                targetCanvas = pageCanvases[pgNum - 1] || null;
+                targetPageNum = batchPages[rawQ.diagram_page - 1];
+                targetCanvas = pageCanvases[targetPageNum - 1] || null;
               } else if (pageCanvases[rawQ.diagram_page - 1]) {
+                targetPageNum = rawQ.diagram_page;
                 targetCanvas = pageCanvases[rawQ.diagram_page - 1];
               }
             }
             if (!targetCanvas && pageCanvases[batchPages[0] - 1]) {
+              targetPageNum = batchPages[0];
               targetCanvas = pageCanvases[batchPages[0] - 1];
             }
 
@@ -1136,19 +1397,30 @@ ${batchPromptTemplate}`,
             }
           }
 
+          const sanitizedQuestionText = sanitizeMathProse(
+            rawQ.question_text || `Question ${totalQuestionsFound}`
+          );
+          const sanitizedExplanation = rawQ.explanation
+            ? sanitizeMathProse(rawQ.explanation)
+            : "";
+          const sanitizedOptions = options
+            ? options.map((opt) => sanitizeMathProse(opt))
+            : null;
+
           const newQ: EditableQuestion = {
             id: `q-ext-${Date.now()}-${totalQuestionsFound}`,
             exam_id: examId,
             subject,
             type,
-            question_text: rawQ.question_text || `Question ${totalQuestionsFound}`,
-            options,
+            question_text: sanitizedQuestionText,
+            options: sanitizedOptions,
             correct_answer: correctAnswer,
-            explanation: rawQ.explanation || "",
+            explanation: sanitizedExplanation,
             positive_marks: rawQ.positive_marks ?? (exam?.positive_marks ?? 4),
             negative_marks: rawQ.negative_marks ?? (exam?.negative_marks ?? 1),
             image_url: diagramUrl,
             has_diagram: !!diagramUrl || rawQ.has_diagram,
+            diagram_page: targetPageNum,
             diagram_bbox: rawQ.diagram_bbox || null,
             isPreviewMode: true,
           };
@@ -2016,6 +2288,15 @@ ${batchPromptTemplate}`,
                         <div className="flex items-center gap-2 self-end sm:self-center">
                           <button
                             type="button"
+                            onClick={() => openAdjustCropModal(q)}
+                            className="px-2.5 py-1 rounded-lg bg-purple-900/40 hover:bg-purple-800/60 border border-purple-700/50 text-purple-200 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
+                            title="Fine-tune diagram bounding box or crop from PDF page"
+                          >
+                            <Crop className="w-3 h-3 text-purple-300" />
+                            <span>Adjust Crop</span>
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => triggerReplaceDiagram(q.id)}
                             className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
                             title="Replace diagram with another file"
@@ -2037,14 +2318,27 @@ ${batchPromptTemplate}`,
                     ) : (
                       <div className="flex items-center justify-between text-xs py-0.5">
                         <span className="text-[11px] text-slate-500">No diagram attached</span>
-                        <button
-                          type="button"
-                          onClick={() => triggerAddDiagram(q.id)}
-                          className="inline-flex items-center gap-1 text-[11px] text-purple-400 hover:text-purple-300 transition cursor-pointer"
-                        >
-                          <ImagePlus className="w-3.5 h-3.5" />
-                          <span>+ Add Diagram / Image</span>
-                        </button>
+                        <div className="flex items-center gap-3">
+                          {(renderedPageCount > 0 || !!questionPdf) && (
+                            <button
+                              type="button"
+                              onClick={() => openAdjustCropModal(q)}
+                              className="inline-flex items-center gap-1 text-[11px] text-cyan-400 hover:text-cyan-300 transition cursor-pointer font-medium"
+                              title="Crop a diagram for this question directly from the PDF pages"
+                            >
+                              <Crop className="w-3.5 h-3.5" />
+                              <span>+ Crop from PDF</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => triggerAddDiagram(q.id)}
+                            className="inline-flex items-center gap-1 text-[11px] text-purple-400 hover:text-purple-300 transition cursor-pointer"
+                          >
+                            <ImagePlus className="w-3.5 h-3.5" />
+                            <span>+ Upload File</span>
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -2206,6 +2500,275 @@ ${batchPromptTemplate}`,
                 </>
               )}
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Interactive Adjust & Fine-Tune Diagram Crop Modal */}
+      {cropModal.isOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/85 backdrop-blur-md animate-in fade-in duration-150">
+          <div className="w-full max-w-5xl max-h-[92vh] flex flex-col bg-slate-900 border border-slate-700/80 rounded-2xl shadow-2xl overflow-hidden">
+            {/* Header */}
+            <div className="px-5 py-3.5 bg-slate-950/80 border-b border-slate-800 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-1.5 rounded-lg bg-purple-500/10 border border-purple-500/20 text-purple-400">
+                  <Crop className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <span>Adjust Diagram Crop</span>
+                    <span className="text-xs font-mono font-normal text-slate-400">
+                      (Question {questions.findIndex((q) => q.id === cropModal.questionId) + 1})
+                    </span>
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    Click & drag directly on the page, or use the nudge buttons to fine-tune edges
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                {/* Page Selector */}
+                <div className="flex items-center gap-1.5 text-xs text-slate-300">
+                  <span className="text-slate-400 text-[11px]">Page:</span>
+                  <div className="relative">
+                    <select
+                      value={cropModal.pageNumber}
+                      onChange={(e) => {
+                        const newPg = Number(e.target.value);
+                        setCropModal((prev) => ({
+                          ...prev,
+                          pageNumber: newPg,
+                        }));
+                      }}
+                      className="pl-2.5 pr-7 py-1 rounded-lg bg-slate-900 border border-slate-700 text-xs font-semibold text-white appearance-none cursor-pointer focus:outline-none focus:border-purple-500"
+                    >
+                      {Array.from({ length: renderedPageCount || 1 }).map((_, i) => (
+                        <option key={i + 1} value={i + 1}>
+                          Page {i + 1} of {renderedPageCount || 1}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setCropModal((prev) => ({ ...prev, isOpen: false }))}
+                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition cursor-pointer"
+                  title="Close without saving"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Body - 2 Columns */}
+            <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden min-h-0">
+              {/* Left Column: Full Page Overview Canvas with drag-crop */}
+              <div className="lg:col-span-7 p-4 bg-slate-950/60 flex flex-col border-b lg:border-b-0 lg:border-r border-slate-800 overflow-hidden">
+                <div className="flex items-center justify-between pb-2 text-xs text-slate-400">
+                  <span className="flex items-center gap-1 font-medium">
+                    <span>PDF Page {cropModal.pageNumber}</span>
+                    <span className="text-[10px] text-cyan-400 bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-800/50">
+                      Drag to select box
+                    </span>
+                  </span>
+                  <span className="text-[10px] text-slate-500 font-mono">
+                    Coords: [{cropModal.bbox.join(", ")}]
+                  </span>
+                </div>
+
+                <div className="flex-1 overflow-auto rounded-xl border border-slate-800 bg-slate-950 p-2 flex items-start justify-center">
+                  <canvas
+                    ref={pageOverviewCanvasRef}
+                    onMouseDown={handleOverviewMouseDown}
+                    onMouseMove={handleOverviewMouseMove}
+                    onMouseUp={handleOverviewMouseUp}
+                    onMouseLeave={handleOverviewMouseUp}
+                    className="max-w-full h-auto shadow-lg rounded border border-slate-800 cursor-crosshair select-none"
+                    style={{ maxHeight: "58vh" }}
+                  />
+                </div>
+              </div>
+
+              {/* Right Column: Live Crop Preview & Precision Nudge Controls */}
+              <div className="lg:col-span-5 p-4 flex flex-col justify-between overflow-y-auto space-y-4 bg-slate-900/80">
+                {/* Crop Preview Box */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                      <ImageIcon className="w-3.5 h-3.5 text-purple-400" />
+                      <span>Cropped Output Preview</span>
+                    </span>
+                    <span className="text-[10px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded font-mono">
+                      PNG (Crisp 2.0x)
+                    </span>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-center min-h-[160px] max-h-[220px] overflow-hidden">
+                    <canvas
+                      ref={cropPreviewCanvasRef}
+                      className="max-h-[190px] max-w-full object-contain rounded border border-slate-800 bg-slate-900"
+                    />
+                  </div>
+                </div>
+
+                {/* Precision Nudge Panel */}
+                <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                      <Sliders className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>Nudge Edges (±10px)</span>
+                    </span>
+                    <span className="text-[10px] text-slate-500">Fine-tune bounds</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    {/* Top Edge */}
+                    <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 font-medium">Top:</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => nudgeCrop("top", -10)}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[11px] font-bold transition cursor-pointer"
+                          title="Expand top upward (-10px)"
+                        >
+                          -10
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => nudgeCrop("top", 10)}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[11px] font-bold transition cursor-pointer"
+                          title="Shrink top downward (+10px)"
+                        >
+                          +10
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Bottom Edge */}
+                    <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 font-medium">Bottom:</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => nudgeCrop("bottom", -10)}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[11px] font-bold transition cursor-pointer"
+                          title="Shrink bottom upward (-10px)"
+                        >
+                          -10
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => nudgeCrop("bottom", 10)}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[11px] font-bold transition cursor-pointer"
+                          title="Expand bottom downward (+10px)"
+                        >
+                          +10
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Left Edge */}
+                    <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 font-medium">Left:</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => nudgeCrop("left", -10)}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[11px] font-bold transition cursor-pointer"
+                          title="Expand left outward (-10px)"
+                        >
+                          -10
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => nudgeCrop("left", 10)}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[11px] font-bold transition cursor-pointer"
+                          title="Shrink left inward (+10px)"
+                        >
+                          +10
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Right Edge */}
+                    <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 font-medium">Right:</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => nudgeCrop("right", -10)}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[11px] font-bold transition cursor-pointer"
+                          title="Shrink right inward (-10px)"
+                        >
+                          -10
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => nudgeCrop("right", 10)}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[11px] font-bold transition cursor-pointer"
+                          title="Expand right outward (+10px)"
+                        >
+                          +10
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Quick Expand / Shrink */}
+                  <div className="flex items-center gap-2 pt-1 border-t border-slate-800/80">
+                    <button
+                      type="button"
+                      onClick={() => expandAllEdges(25)}
+                      className="flex-1 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[11px] font-medium text-slate-200 transition cursor-pointer text-center"
+                    >
+                      +25px Padding (All Edges)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => expandAllEdges(-25)}
+                      className="flex-1 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[11px] font-medium text-slate-200 transition cursor-pointer text-center"
+                    >
+                      -25px Shrink (All Edges)
+                    </button>
+                  </div>
+                </div>
+
+                {/* Save / Apply Button */}
+                <div className="pt-2 flex items-center justify-end gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => setCropModal((prev) => ({ ...prev, isOpen: false }))}
+                    disabled={cropModal.isSaving}
+                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSaveAdjustedCrop}
+                    disabled={cropModal.isSaving}
+                    className="px-5 py-2 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 text-white text-xs font-bold flex items-center gap-2 shadow-lg shadow-purple-500/20 active:scale-[0.99] disabled:opacity-50 transition cursor-pointer"
+                  >
+                    {cropModal.isSaving ? (
+                      <>
+                        <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        <span>Saving & Uploading Crop...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Check className="w-4 h-4" />
+                        <span>Save & Apply Crop</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       )}

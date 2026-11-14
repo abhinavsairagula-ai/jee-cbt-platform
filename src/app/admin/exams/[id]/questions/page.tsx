@@ -18,7 +18,55 @@ import {
   Calculator,
   HelpCircle,
   Eye,
+  Image as ImageIcon,
+  ImagePlus,
+  UploadCloud,
+  X,
+  Check,
+  Clipboard,
+  ExternalLink,
 } from "lucide-react";
+
+async function uploadQuestionImageBlob(
+  supabase: ReturnType<typeof createClient>,
+  examId: string,
+  filename: string,
+  blob: Blob
+): Promise<string | null> {
+  const cleanFilename = `${Date.now()}-${filename.replace(/[^a-zA-Z0-9.-]/g, "_")}`;
+
+  // 1. Try 'question-images' bucket
+  try {
+    const path = `${examId}/${cleanFilename}`;
+    const { error } = await supabase.storage
+      .from("question-images")
+      .upload(path, blob, { contentType: blob.type || "image/png", upsert: true });
+
+    if (!error) {
+      const { data } = supabase.storage.from("question-images").getPublicUrl(path);
+      if (data?.publicUrl) return data.publicUrl;
+    }
+  } catch (err) {
+    console.warn("Storage upload to question-images notice:", err);
+  }
+
+  // 2. Fallback to 'exam-pdfs' bucket under diagrams/{examId}/
+  try {
+    const fbPath = `diagrams/${examId}/${cleanFilename}`;
+    const { error: fbErr } = await supabase.storage
+      .from("exam-pdfs")
+      .upload(fbPath, blob, { contentType: blob.type || "image/png", upsert: true });
+
+    if (!fbErr) {
+      const { data } = supabase.storage.from("exam-pdfs").getPublicUrl(fbPath);
+      if (data?.publicUrl) return data.publicUrl;
+    }
+  } catch (fbErr) {
+    console.warn("Storage upload to exam-pdfs fallback notice:", fbErr);
+  }
+
+  return null;
+}
 
 const SUBJECT_CONFIG: Record<
   Subject,
@@ -214,6 +262,185 @@ function ExamQuestionsContent() {
       }
     } catch (err: unknown) {
       alert(err instanceof Error ? err.message : "Error deleting question.");
+    }
+  };
+
+  // Replace / Add Diagram Image Modal State
+  interface ImageModalState {
+    isOpen: boolean;
+    question: Question | null;
+    newBlob: Blob | null;
+    newPreviewUrl: string | null;
+    isUploading: boolean;
+    isRemoving: boolean;
+    error: string | null;
+  }
+
+  const [imageModal, setImageModal] = useState<ImageModalState>({
+    isOpen: false,
+    question: null,
+    newBlob: null,
+    newPreviewUrl: null,
+    isUploading: false,
+    isRemoving: false,
+    error: null,
+  });
+
+  const openImageModal = (q: Question) => {
+    setImageModal({
+      isOpen: true,
+      question: q,
+      newBlob: null,
+      newPreviewUrl: null,
+      isUploading: false,
+      isRemoving: false,
+      error: null,
+    });
+  };
+
+  const closeImageModal = () => {
+    if (imageModal.newPreviewUrl) {
+      URL.revokeObjectURL(imageModal.newPreviewUrl);
+    }
+    setImageModal({
+      isOpen: false,
+      question: null,
+      newBlob: null,
+      newPreviewUrl: null,
+      isUploading: false,
+      isRemoving: false,
+      error: null,
+    });
+  };
+
+  const handleSelectImageFile = (file: File) => {
+    if (!file.type.startsWith("image/")) {
+      setImageModal((prev) => ({
+        ...prev,
+        error: "Please select a valid image file (PNG, JPG, WebP, SVG).",
+      }));
+      return;
+    }
+    const preview = URL.createObjectURL(file);
+    setImageModal((prev) => ({
+      ...prev,
+      newBlob: file,
+      newPreviewUrl: preview,
+      error: null,
+    }));
+  };
+
+  // Listen for Ctrl+V paste while modal is open
+  useEffect(() => {
+    if (!imageModal.isOpen) return;
+
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.startsWith("image/")) {
+          const file = items[i].getAsFile();
+          if (file) {
+            e.preventDefault();
+            const preview = URL.createObjectURL(file);
+            setImageModal((prev) => ({
+              ...prev,
+              newBlob: file,
+              newPreviewUrl: preview,
+              error: null,
+            }));
+            break;
+          }
+        }
+      }
+    };
+
+    window.addEventListener("paste", handlePaste);
+    return () => {
+      window.removeEventListener("paste", handlePaste);
+    };
+  }, [imageModal.isOpen]);
+
+  const handleUploadAndSaveImage = async () => {
+    if (!imageModal.question || !imageModal.newBlob) return;
+    const qId = imageModal.question.id;
+
+    setImageModal((prev) => ({ ...prev, isUploading: true, error: null }));
+    try {
+      const filename =
+        imageModal.newBlob instanceof File && imageModal.newBlob.name
+          ? imageModal.newBlob.name
+          : "diagram.png";
+
+      const publicUrl = await uploadQuestionImageBlob(
+        supabase,
+        examId,
+        filename,
+        imageModal.newBlob
+      );
+
+      if (!publicUrl) {
+        throw new Error("Failed to upload image to Supabase Storage.");
+      }
+
+      // Update question record in Supabase
+      const { error: dbError } = await supabase
+        .from("questions")
+        .update({ image_url: publicUrl })
+        .eq("id", qId);
+
+      if (dbError) {
+        throw new Error(dbError.message);
+      }
+
+      // Update local state
+      setQuestions((prev) =>
+        prev.map((item) => (item.id === qId ? { ...item, image_url: publicUrl } : item))
+      );
+
+      setSuccessNotice(`Question diagram updated successfully!`);
+      closeImageModal();
+    } catch (err: unknown) {
+      console.error("Image upload/save error:", err);
+      setImageModal((prev) => ({
+        ...prev,
+        isUploading: false,
+        error: err instanceof Error ? err.message : "Failed to update question image.",
+      }));
+    }
+  };
+
+  const handleRemoveExistingImage = async () => {
+    if (!imageModal.question) return;
+    const qId = imageModal.question.id;
+
+    if (!confirm("Remove this diagram from the question?")) return;
+
+    setImageModal((prev) => ({ ...prev, isRemoving: true, error: null }));
+    try {
+      const { error: dbError } = await supabase
+        .from("questions")
+        .update({ image_url: null })
+        .eq("id", qId);
+
+      if (dbError) {
+        throw new Error(dbError.message);
+      }
+
+      setQuestions((prev) =>
+        prev.map((item) => (item.id === qId ? { ...item, image_url: null } : item))
+      );
+
+      setSuccessNotice("Diagram removed from question.");
+      closeImageModal();
+    } catch (err: unknown) {
+      console.error("Remove image error:", err);
+      setImageModal((prev) => ({
+        ...prev,
+        isRemoving: false,
+        error: err instanceof Error ? err.message : "Failed to remove diagram.",
+      }));
     }
   };
 
@@ -679,10 +906,33 @@ function ExamQuestionsContent() {
                     </span>
                   </div>
 
-                  <div className="flex items-center gap-3">
-                    <span className="text-[11px] text-slate-500 font-mono">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-slate-500 font-mono mr-1">
                       +{q.positive_marks} / -{q.negative_marks}
                     </span>
+
+                    <button
+                      type="button"
+                      onClick={() => openImageModal(q)}
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition cursor-pointer border ${
+                        q.image_url
+                          ? "bg-purple-950/40 hover:bg-purple-900/60 border-purple-700/50 text-purple-300"
+                          : "bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300 hover:text-white"
+                      }`}
+                      title={q.image_url ? "Replace or remove diagram" : "Add diagram / image to question"}
+                    >
+                      {q.image_url ? (
+                        <>
+                          <ImageIcon className="w-3.5 h-3.5 text-purple-400" />
+                          <span>Replace Image</span>
+                        </>
+                      ) : (
+                        <>
+                          <ImagePlus className="w-3.5 h-3.5 text-blue-400" />
+                          <span>Add Image</span>
+                        </>
+                      )}
+                    </button>
 
                     <button
                       onClick={() => handleDeleteQuestion(q.id)}
@@ -698,12 +948,34 @@ function ExamQuestionsContent() {
                 <div className="text-sm text-slate-100 leading-relaxed font-normal space-y-2">
                   <MathView math={q.question_text} />
                   {q.image_url && (
-                    <div className="pt-2">
-                      <img
-                        src={q.image_url}
-                        alt="Question Diagram"
-                        className="max-h-56 max-w-full rounded-xl border border-slate-800 bg-white/5 object-contain"
-                      />
+                    <div className="pt-2 flex items-start gap-3">
+                      <div className="relative group max-w-fit">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={q.image_url}
+                          alt="Question Diagram"
+                          className="max-h-56 max-w-full rounded-xl border border-slate-800 bg-white/5 object-contain"
+                        />
+                        <div className="absolute inset-0 bg-slate-950/70 opacity-0 group-hover:opacity-100 transition rounded-xl flex items-center justify-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => openImageModal(q)}
+                            className="px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold flex items-center gap-1 shadow-md transition cursor-pointer"
+                          >
+                            <ImageIcon className="w-3.5 h-3.5" />
+                            <span>Replace</span>
+                          </button>
+                          <a
+                            href={q.image_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition"
+                            title="Open diagram in new tab"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        </div>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -767,6 +1039,174 @@ function ExamQuestionsContent() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Replace / Add Diagram Image Modal */}
+      {imageModal.isOpen && imageModal.question && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md animate-in fade-in duration-150">
+          <div className="w-full max-w-2xl bg-slate-900 border border-slate-700/80 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+            {/* Modal Header */}
+            <div className="px-5 py-4 bg-slate-950/80 border-b border-slate-800 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-1.5 rounded-lg bg-purple-500/10 border border-purple-500/20 text-purple-400">
+                  <ImageIcon className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <span>
+                      {imageModal.question.image_url
+                        ? "Replace Question Diagram"
+                        : "Add Question Diagram"}
+                    </span>
+                    <span className="text-xs font-mono font-normal text-slate-400">
+                      (Question {questions.findIndex((q) => q.id === imageModal.question?.id) + 1})
+                    </span>
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    Paste a screenshot (<kbd className="px-1 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[10px]">Ctrl+V</kbd>) anywhere or choose an image file from your computer
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={closeImageModal}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 overflow-y-auto space-y-4">
+              {imageModal.error && (
+                <div className="p-3 rounded-xl bg-red-950/40 border border-red-800/60 text-red-300 text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+                  <span>{imageModal.error}</span>
+                </div>
+              )}
+
+              {/* Paste or Drop Zone */}
+              <label
+                htmlFor="diagram-file-picker"
+                className={`relative flex flex-col items-center justify-center p-6 rounded-2xl border-2 border-dashed transition cursor-pointer ${
+                  imageModal.newPreviewUrl
+                    ? "border-emerald-500/50 bg-emerald-950/10"
+                    : "border-purple-500/40 hover:border-purple-400 bg-slate-950/60 hover:bg-purple-950/10"
+                }`}
+              >
+                <input
+                  id="diagram-file-picker"
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) handleSelectImageFile(f);
+                  }}
+                />
+
+                {imageModal.newPreviewUrl ? (
+                  <div className="space-y-3 text-center w-full">
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold">
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      <span>New Screenshot / Image Ready</span>
+                    </div>
+
+                    <div className="max-h-60 overflow-hidden flex items-center justify-center p-2 rounded-xl bg-slate-950 border border-slate-800">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={imageModal.newPreviewUrl}
+                        alt="New diagram preview"
+                        className="max-h-56 max-w-full object-contain rounded-lg"
+                      />
+                    </div>
+
+                    <p className="text-[11px] text-slate-400">
+                      Click to choose a different file or press <kbd className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-200 font-mono text-[10px]">Ctrl+V</kbd> to paste another screenshot
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center gap-2 text-center py-4">
+                    <div className="w-12 h-12 rounded-2xl bg-purple-500/10 border border-purple-500/20 text-purple-400 flex items-center justify-center mb-1">
+                      <Clipboard className="w-6 h-6" />
+                    </div>
+                    <div className="text-sm font-bold text-white">
+                      Press <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-purple-300 font-mono text-xs">Ctrl + V</kbd> to paste screenshot
+                    </div>
+                    <p className="text-xs text-slate-400 max-w-sm">
+                      or click here to browse and select an image file from your computer (PNG, JPG, WebP)
+                    </p>
+                  </div>
+                )}
+              </label>
+
+              {/* Current Question Diagram (if already exists and user hasn't selected new yet) */}
+              {!imageModal.newPreviewUrl && imageModal.question.image_url && (
+                <div className="space-y-2 pt-2 border-t border-slate-800/80">
+                  <span className="text-xs font-semibold text-slate-400 block">
+                    Current Question Diagram:
+                  </span>
+                  <div className="p-2 rounded-xl bg-slate-950 border border-slate-800 max-h-44 overflow-hidden flex items-center justify-center">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={imageModal.question.image_url}
+                      alt="Current Diagram"
+                      className="max-h-40 max-w-full object-contain rounded-lg"
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-5 py-3.5 bg-slate-950/80 border-t border-slate-800 flex items-center justify-between gap-3">
+              {imageModal.question.image_url ? (
+                <button
+                  type="button"
+                  onClick={handleRemoveExistingImage}
+                  disabled={imageModal.isRemoving || imageModal.isUploading}
+                  className="px-3 py-1.5 rounded-xl bg-red-950/40 hover:bg-red-900/60 border border-red-800/60 text-red-300 hover:text-red-200 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>{imageModal.isRemoving ? "Removing..." : "Remove Diagram"}</span>
+                </button>
+              ) : (
+                <div />
+              )}
+
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={closeImageModal}
+                  disabled={imageModal.isUploading}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleUploadAndSaveImage}
+                  disabled={!imageModal.newBlob || imageModal.isUploading}
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 text-white text-xs font-bold flex items-center gap-2 shadow-lg shadow-purple-500/20 active:scale-[0.99] disabled:opacity-40 transition cursor-pointer"
+                >
+                  {imageModal.isUploading ? (
+                    <>
+                      <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      <span>Uploading to Storage...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Check className="w-4 h-4" />
+                      <span>Upload & Save Image</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>
