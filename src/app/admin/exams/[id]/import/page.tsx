@@ -94,7 +94,7 @@ function PdfImportContent() {
     }
     return "";
   });
-  const [model, setModel] = useState("gemini-2.5-flash");
+  const [model, setModel] = useState("gemini-flash-latest");
 
   // Drag states
   const [isQDragOver, setIsQDragOver] = useState(false);
@@ -711,20 +711,20 @@ function PdfImportContent() {
                   onChange={(e) => setModel(e.target.value)}
                   className="w-full pl-3 pr-8 py-2 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs focus:outline-none focus:border-purple-500 appearance-none cursor-pointer transition"
                 >
-                  <option value="gemini-2.5-flash">
-                    gemini-2.5-flash (Active • Fast & Multimodal)
-                  </option>
                   <option value="gemini-flash-latest">
-                    gemini-flash-latest (Latest Stable Flash)
+                    gemini-flash-latest (Recommended • Verified Active)
+                  </option>
+                  <option value="gemini-3.1-flash-lite">
+                    gemini-3.1-flash-lite (Ultra Fast • Low Latency)
+                  </option>
+                  <option value="gemini-3.5-flash">
+                    gemini-3.5-flash (Gemini 3.5 Flash)
                   </option>
                   <option value="gemini-3.8-flash">
                     gemini-3.8-flash (Gemini 3.8 Flash)
                   </option>
-                  <option value="gemini-2.5-pro">
-                    gemini-2.5-pro (Complex Mathematical Reasoning)
-                  </option>
-                  <option value="gemini-3.5-flash">
-                    gemini-3.5-flash (Gemini 3.5 Flash)
+                  <option value="gemini-pro-latest">
+                    gemini-pro-latest (Pro Reasoning Quality)
                   </option>
                 </select>
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />

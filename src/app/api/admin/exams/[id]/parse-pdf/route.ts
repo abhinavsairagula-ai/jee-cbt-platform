@@ -66,7 +66,7 @@ export async function POST(
     const solutionPaper = formData.get("solutionPaper") as File | null;
     const clientApiKey = (formData.get("apiKey") as string | null)?.trim();
     const rawRequestedModel =
-      (formData.get("model") as string | null)?.trim() || "gemini-2.5-flash";
+      (formData.get("model") as string | null)?.trim() || "gemini-flash-latest";
     const requestedModel = rawRequestedModel.replace(/^models\//, "");
 
     if (!questionPaper) {
@@ -193,18 +193,16 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
     parts.push({ text: systemPrompt });
 
     // 7. Call Gemini REST API with robust endpoint & model fallback
-    // Prioritize models that are confirmed active for the API key
+    // Prioritize models that are confirmed active and responsive for the API key
     const fallbackModelList = [
       requestedModel,
-      "gemini-2.5-flash",
       "gemini-flash-latest",
-      "gemini-3.8-flash",
+      "gemini-3.1-flash-lite",
       "gemini-3.5-flash",
-      "gemini-2.5-pro",
+      "gemini-3.8-flash",
+      "gemini-2.5-flash",
       "gemini-pro-latest",
       "gemini-1.5-flash",
-      "gemini-1.5-flash-latest",
-      "gemini-2.0-flash",
     ];
 
     const candidateConfigs: Array<{ model: string; apiVersion: "v1beta" | "v1" }> = [];
@@ -290,8 +288,15 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
             // Keep text
           }
 
-          // If 404 Model Not Found or 400 Bad Request (e.g. model/version mismatch), continue to next fallback
-          if ((res.status === 404 || res.status === 400) && i < uniqueConfigs.length - 1) {
+          // If 404 (model unavailable), 400 (bad request), 503 (high demand/overloaded), 429 (rate limit), or 500, fallback to next candidate
+          const isFallbackEligible =
+            res.status === 404 ||
+            res.status === 400 ||
+            res.status === 503 ||
+            res.status === 429 ||
+            res.status === 500;
+
+          if (isFallbackEligible && i < uniqueConfigs.length - 1) {
             console.warn(`[Gemini Fallback] ${apiVersion}/models/${model} returned ${res.status}: ${parsedError}`);
             lastError = `(${apiVersion}/${model}) ${parsedError}`;
             continue;
