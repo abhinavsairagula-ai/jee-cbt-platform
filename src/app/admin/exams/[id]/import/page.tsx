@@ -1538,8 +1538,8 @@ ${batchPromptTemplate}`,
     };
   }, [questions]);
 
-  // Save all questions to Supabase in a batch insert
-  const handleSaveAllToExam = async () => {
+  // Save all questions to Supabase in a batch insert (optionally publishing the exam)
+  const handleSaveAllToExam = async (publishExam: boolean = false) => {
     if (questions.length === 0) {
       setErrorMessage("No questions available to save.");
       return;
@@ -1586,8 +1586,22 @@ ${batchPromptTemplate}`,
         throw new Error(insertError.message);
       }
 
+      // If requested to publish the exam, update exams table
+      if (publishExam) {
+        const { error: publishError } = await supabase
+          .from("exams")
+          .update({ is_active: true })
+          .eq("id", examId);
+
+        if (publishError) {
+          console.warn("Notice: questions saved, but failed to update publication status:", publishError.message);
+        }
+      }
+
       setSuccessMessage(
-        `Successfully imported ${payload.length} questions into "${exam?.title || "Exam"}"!`
+        publishExam
+          ? `Successfully imported ${payload.length} questions and PUBLISHED "${exam?.title || "Exam"}" to live CBT!`
+          : `Successfully saved ${payload.length} questions to "${exam?.title || "Exam"}" as DRAFT!`
       );
 
       // Redirect back to question manager after 1.2s
@@ -1654,9 +1668,9 @@ ${batchPromptTemplate}`,
           </p>
         </div>
 
-        {/* Action button if questions are ready */}
+        {/* Action buttons if questions are ready */}
         {questions.length > 0 && (
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
               onClick={handleAddNewQuestion}
@@ -1666,21 +1680,39 @@ ${batchPromptTemplate}`,
               <span>Add Manual Question</span>
             </button>
 
+            {/* Save Questions (Keep Draft) */}
             <button
               type="button"
-              onClick={handleSaveAllToExam}
+              onClick={() => handleSaveAllToExam(false)}
+              disabled={isSaving}
+              className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 font-semibold text-xs flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+              title="Save all questions and keep exam in Draft mode"
+            >
+              {isSaving ? (
+                <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              ) : (
+                <Save className="w-3.5 h-3.5 text-amber-400" />
+              )}
+              <span>Save Questions (Keep Draft)</span>
+            </button>
+
+            {/* Save & Publish Exam */}
+            <button
+              type="button"
+              onClick={() => handleSaveAllToExam(true)}
               disabled={isSaving}
               className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs flex items-center gap-2 shadow-lg shadow-emerald-500/25 active:scale-[0.99] disabled:opacity-50 transition cursor-pointer"
+              title="Save all questions and immediately publish the exam for candidates"
             >
               {isSaving ? (
                 <>
                   <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  <span>Saving {questions.length} Questions...</span>
+                  <span>Saving & Publishing...</span>
                 </>
               ) : (
                 <>
-                  <Save className="w-4 h-4" />
-                  <span>Save All ({questions.length}) to Exam</span>
+                  <CheckCircle2 className="w-4 h-4 text-emerald-200" />
+                  <span>Save & Publish Exam</span>
                 </>
               )}
             </button>
@@ -2488,24 +2520,38 @@ ${batchPromptTemplate}`,
               </span>
             </div>
 
-            <button
-              type="button"
-              onClick={handleSaveAllToExam}
-              disabled={isSaving || questions.length === 0}
-              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs flex items-center gap-2 shadow-lg shadow-emerald-500/25 active:scale-[0.99] disabled:opacity-50 transition cursor-pointer"
-            >
-              {isSaving ? (
-                <>
-                  <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  <span>Batch Inserting to Database...</span>
-                </>
-              ) : (
-                <>
-                  <Save className="w-4 h-4" />
-                  <span>Batch Insert {questions.length} Questions</span>
-                </>
-              )}
-            </button>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => handleSaveAllToExam(false)}
+                disabled={isSaving || questions.length === 0}
+                className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 font-semibold text-xs flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                title="Save all questions and keep exam in Draft mode"
+              >
+                <Save className="w-3.5 h-3.5 text-amber-400" />
+                <span>Save (Keep Draft)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleSaveAllToExam(true)}
+                disabled={isSaving || questions.length === 0}
+                className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs flex items-center gap-2 shadow-lg shadow-emerald-500/25 active:scale-[0.99] disabled:opacity-50 transition cursor-pointer"
+                title="Save all questions and immediately publish the exam for candidates"
+              >
+                {isSaving ? (
+                  <>
+                    <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    <span>Saving & Publishing...</span>
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 className="w-4 h-4 text-emerald-200" />
+                    <span>Save & Publish Exam ({questions.length})</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       )}

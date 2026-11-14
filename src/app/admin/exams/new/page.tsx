@@ -24,7 +24,7 @@ export default function CreateExamPage() {
   const [positiveMarks, setPositiveMarks] = useState(4);
   const [negativeMarks, setNegativeMarks] = useState(1);
   const [hasNegativeMarking, setHasNegativeMarking] = useState(true);
-  const [isActive, setIsActive] = useState(true);
+  const [isActive, setIsActive] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -145,7 +145,7 @@ export default function CreateExamPage() {
             <div>
               <div className="text-xs font-semibold text-slate-200">Publication Status</div>
               <div className="text-[11px] text-slate-400">
-                Activate to make this exam available to candidates.
+                New exams default to Draft so you can add questions and verify diagrams before publishing.
               </div>
             </div>
             <button
@@ -156,9 +156,17 @@ export default function CreateExamPage() {
               {isActive ? (
                 <ToggleRight className="w-7 h-7 text-emerald-400" />
               ) : (
-                <ToggleLeft className="w-7 h-7 text-slate-600" />
+                <ToggleLeft className="w-7 h-7 text-amber-400" />
               )}
-              <span className="text-xs font-medium">{isActive ? "Active" : "Draft"}</span>
+              <span
+                className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${
+                  isActive
+                    ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                    : "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                }`}
+              >
+                {isActive ? "Published (Live CBT)" : "Draft (Hidden from candidates)"}
+              </span>
             </button>
           </div>
         </div>

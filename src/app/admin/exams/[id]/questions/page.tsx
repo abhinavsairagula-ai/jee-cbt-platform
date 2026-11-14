@@ -25,6 +25,7 @@ import {
   Check,
   Clipboard,
   ExternalLink,
+  FileEdit,
 } from "lucide-react";
 
 async function uploadQuestionImageBlob(
@@ -122,6 +123,35 @@ function ExamQuestionsContent() {
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
+  const [togglingPublish, setTogglingPublish] = useState(false);
+
+  const handleTogglePublish = async () => {
+    if (!exam) return;
+    const nextStatus = !exam.is_active;
+    try {
+      setTogglingPublish(true);
+      const { error } = await supabase
+        .from("exams")
+        .update({ is_active: nextStatus })
+        .eq("id", exam.id);
+
+      if (error) {
+        alert(`Failed to update publication status: ${error.message}`);
+      } else {
+        setExam((prev) => (prev ? { ...prev, is_active: nextStatus } : prev));
+        setSuccessNotice(
+          nextStatus
+            ? "Exam successfully published! It is now live and available to candidates."
+            : "Exam moved to Draft. It is now hidden from candidates."
+        );
+        setTimeout(() => setSuccessNotice(null), 4000);
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : "Failed to toggle status.");
+    } finally {
+      setTogglingPublish(false);
+    }
+  };
 
   useEffect(() => {
     let ignore = false;
@@ -500,16 +530,63 @@ function ExamQuestionsContent() {
             <span>/</span>
             <span className="text-slate-200">Question Manager</span>
           </div>
-          <h1 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
-            {exam.title}
-          </h1>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h1 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
+              {exam.title}
+            </h1>
+            <span
+              className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold border ${
+                exam.is_active
+                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                  : "bg-amber-500/10 text-amber-400 border-amber-500/30"
+              }`}
+            >
+              {exam.is_active ? (
+                <>
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Published (Live)</span>
+                </>
+              ) : (
+                <>
+                  <FileEdit className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Draft (Hidden)</span>
+                </>
+              )}
+            </span>
+          </div>
           <p className="text-xs text-slate-400">
             Duration: {exam.duration_minutes} Mins • Total Marks: {exam.total_marks} • Marking: +
             {exam.positive_marks} / -{exam.negative_marks}
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Publish / Move to Draft One-Click Toggle */}
+          <button
+            type="button"
+            onClick={handleTogglePublish}
+            disabled={togglingPublish}
+            className={`inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl font-semibold text-sm transition shadow-sm cursor-pointer disabled:opacity-50 ${
+              exam.is_active
+                ? "bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                : "bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-emerald-500/25"
+            }`}
+            title={
+              exam.is_active
+                ? "Unpublish exam to Draft (hide from candidates)"
+                : "Publish exam live for candidates"
+            }
+          >
+            {togglingPublish ? (
+              <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+            ) : exam.is_active ? (
+              <FileEdit className="w-4 h-4 text-amber-400" />
+            ) : (
+              <CheckCircle2 className="w-4 h-4 text-white" />
+            )}
+            <span>{exam.is_active ? "Unpublish to Draft" : "Publish Exam"}</span>
+          </button>
+
           <Link
             href={`/admin/exams/${examId}/import`}
             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-semibold text-sm transition shadow-lg shadow-purple-500/25 cursor-pointer"
