@@ -4,6 +4,7 @@ import { useEffect, useState, useMemo, Suspense, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
+import { safeParseJson } from "@/lib/json-repair";
 import type { Exam, Subject, QuestionType } from "@/types/database";
 import MathView from "@/components/MathView";
 import {
@@ -325,37 +326,18 @@ function PdfImportContent() {
 
       clearInterval(timerInterval);
       setParseProgress(98);
-      setParseStatus("Validating and parsing extracted questions JSON...");
-
-      let cleanedJson = fullText.trim();
-      if (cleanedJson.startsWith("```json")) {
-        cleanedJson = cleanedJson.replace(/^```json\s*/, "").replace(/```$/, "").trim();
-      } else if (cleanedJson.startsWith("```")) {
-        cleanedJson = cleanedJson.replace(/^```\s*/, "").replace(/```$/, "").trim();
-      }
+      setParseStatus("Sanitizing LaTeX backslashes & validating JSON schema...");
 
       let parsedResult: { exam_title?: string; questions?: unknown[] } | unknown[];
       try {
-        parsedResult = JSON.parse(cleanedJson);
-      } catch {
-        const firstBrace = cleanedJson.indexOf("{");
-        const lastBrace = cleanedJson.lastIndexOf("}");
-        if (firstBrace !== -1 && lastBrace !== -1) {
-          parsedResult = JSON.parse(cleanedJson.substring(firstBrace, lastBrace + 1));
-        } else {
-          const firstBracket = cleanedJson.indexOf("[");
-          const lastBracket = cleanedJson.lastIndexOf("]");
-          if (firstBracket !== -1 && lastBracket !== -1) {
-            parsedResult = {
-              questions: JSON.parse(cleanedJson.substring(firstBracket, lastBracket + 1)),
-            };
-          } else {
-            throw new Error(
-              "Gemini did not return valid JSON. Stream preview: " +
-                cleanedJson.slice(0, 200)
-            );
-          }
-        }
+        parsedResult = safeParseJson<{ exam_title?: string; questions?: unknown[] } | unknown[]>(fullText);
+      } catch (parseErr) {
+        console.error("JSON parse/repair failed:", parseErr, fullText.slice(0, 500));
+        throw new Error(
+          `Failed to parse AI response into valid JSON: ${
+            parseErr instanceof Error ? parseErr.message : String(parseErr)
+          }`
+        );
       }
 
       const rawQuestions = Array.isArray(parsedResult)

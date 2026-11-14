@@ -168,11 +168,12 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
    - "mcq": Questions with 4 options.
    - "numerical": Questions requiring an integer or decimal numerical answer without options.
 
-3. KATEX / LATEX FORMATTING (MANDATORY):
+3. KATEX / LATEX FORMATTING & BACKSLASH ESCAPING (CRITICAL):
+   - Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta) so the output is 100% valid JSON.
    - Every single variable, equation, scientific notation, unit, chemical formula, or mathematical symbol MUST be formatted in standard KaTeX.
    - Use '$...$' for inline math (e.g. '$x^2 + y^2 = r^2$', '$\\frac{hc}{\\lambda}$', '$\\text{KMnO}_4$').
    - Use '$$...$$' for standalone or display equations.
-   - In JSON, properly escape backslashes (use '\\\\frac', '\\\\sqrt', '\\\\theta', '\\\\vec{F}', '\\\\int', etc.).
+   - In JSON, ALWAYS write double backslashes for all LaTeX commands: use '\\\\frac', '\\\\int', '\\\\theta', '\\\\alpha', '\\\\sin', '\\\\vec', '\\\\sqrt', '\\\\cos', '\\\\text', '\\\\sum', etc. Never write a single backslash.
    - Format chemical species and reactions properly (e.g., '$\\text{H}_2\\text{SO}_4$', '$\\text{Zn} + 2\\text{HCl} \\rightarrow \\text{ZnCl}_2 + \\text{H}_2$').
 
 4. MCQ OPTIONS & ANSWER:
@@ -188,17 +189,18 @@ STRICT EXTRACTION AND FORMATTING INSTRUCTIONS:
    - Provide a concise 2-4 line derivation/rationale for 'explanation' highlighting the key formula and final numerical steps in KaTeX. Keep explanations focused to ensure fast processing.
 
 7. OUTPUT SCHEMA:
-   Return valid JSON with NO conversational markdown preamble or postscript:
+   Return valid JSON with NO conversational markdown preamble or postscript.
+   CRITICAL: Escape all LaTeX backslashes as double backslashes (e.g. \\frac, \\int, \\theta) so the output is 100% valid JSON:
    {
      "exam_title": "string or exam name found in paper",
      "questions": [
        {
          "subject": "physics" | "chemistry" | "mathematics",
          "type": "mcq" | "numerical",
-         "question_text": "string with $KaTeX$",
+         "question_text": "string with $KaTeX$ (all LaTeX backslashes double-escaped as \\\\)",
          "options": ["string", "string", "string", "string"] | null,
          "correct_answer": "A" | "B" | "C" | "D" | "numerical_string",
-         "explanation": "string with $KaTeX$"
+         "explanation": "string with $KaTeX$ (all LaTeX backslashes double-escaped as \\\\)"
        }
      ]
    }`;
