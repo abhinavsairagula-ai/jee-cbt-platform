@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import AdminSignOutButton from "@/components/admin/AdminSignOutButton";
 
-export const instant = false;
+
 
 export default async function AdminLayout({
   children,
