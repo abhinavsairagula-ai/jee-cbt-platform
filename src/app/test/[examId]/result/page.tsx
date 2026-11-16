@@ -30,7 +30,7 @@ interface SubjectStats {
   attempted: number;
   correct: number;
   incorrect: number;
-  score: number;
+  total_score: number;
   maxScore: number;
 }
 
@@ -81,20 +81,24 @@ function ExamResultContent() {
         const { data: qData } = await supabase
           .from("questions")
           .select("*")
-          .eq("exam_id", examId)
+          .eq('test_id', examId)
           .order("created_at", { ascending: true });
 
         if (!ignore && qData) setQuestions(qData);
 
-        // Fetch Submission
-        const { data: subData } = await supabase
+       // Fetch Submission
+        const { data: subData, error: subError } = await supabase
           .from("submissions")
           .select("*")
-          .eq("user_id", user.id)
-          .eq("exam_id", examId)
-          .order("created_at", { ascending: false })
+          .eq('student_id', user.id)
+          .eq('test_id', examId)
+          .order("submitted_at", { ascending: false })
           .limit(1)
           .maybeSingle();
+
+        if (subError) {
+          console.error("Supabase submission fetch error:", subError.message);
+        }
 
         if (!ignore && subData) {
           setSubmission(subData as Submission);
@@ -169,7 +173,7 @@ function ExamResultContent() {
           attempted: sAttempted,
           correct: sCorrect,
           incorrect: sIncorrect,
-          score: sScore,
+          total_score: sScore,
           maxScore: sMaxScore,
         };
       });
@@ -396,8 +400,8 @@ function ExamResultContent() {
                         {stat.incorrect}
                       </td>
                       <td className="py-3.5 px-4 text-right font-mono font-bold text-white">
-                        <span className={stat.score >= 0 ? "text-emerald-400" : "text-red-400"}>
-                          {stat.score > 0 ? `+${stat.score}` : stat.score}
+                        <span className={stat.total_score >= 0 ? "text-emerald-400" : "text-red-400"}>
+                          {stat.total_score > 0 ? `+${stat.total_score}` : stat.total_score}
                         </span>
                         <span className="text-slate-500 font-normal"> / {stat.maxScore}</span>
                       </td>

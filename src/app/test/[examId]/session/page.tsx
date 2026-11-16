@@ -262,6 +262,32 @@ function ExamSessionContent() {
   const [paletteOpen, setPaletteOpen] = useState(true);
 
   const isFinalizing = useRef(false);
+  const candidateAnswersRef = useRef<Record<string, CandidateAnswer>>({});
+  const secondsRemainingRef = useRef<number>(180 * 60);
+
+  useEffect(() => {
+    candidateAnswersRef.current = candidateAnswers;
+  }, [candidateAnswers]);
+
+  useEffect(() => {
+    secondsRemainingRef.current = secondsRemaining;
+  }, [secondsRemaining]);
+
+  // Browser Exit Guard: prevent accidental tab close or page reload during active test
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!isFinalizing.current && !isSubmitting) {
+        e.preventDefault();
+        e.returnValue = "";
+        return "";
+      }
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
+  }, [isSubmitting]);
 
   // Granular Question & Subject Telemetry Refs (No extra re-renders per second)
   const telemetryRef = useRef<Record<string, QuestionTelemetry>>({});
@@ -314,7 +340,239 @@ function ExamSessionContent() {
     [flushActiveQuestionTime]
   );
 
-  // Load Exam, Questions, and existing Submission
+  // Auto-Save & Upsert progress to public.test_sessions and localStorage
+  const persistSessionProgress = useCallback(
+    async (
+      answersToSave: Record<string, CandidateAnswer>,
+      remainingSecs: number
+    ) => {
+      if (!userId || !examId || isFinalizing.current) return;
+
+      const markedList: string[] = [];
+      const visitedList: string[] = [];
+
+      Object.values(answersToSave).forEach((ans) => {
+        if (ans.status !== "not_visited") {
+          visitedList.push(ans.question_id);
+        }
+        if (
+          ans.status === "marked_for_review" ||
+          ans.status === "answered_and_marked_for_review"
+        ) {
+          markedList.push(ans.question_id);
+        }
+      });
+
+      const sessionPayload = {
+        user_id: userId,
+        exam_id: examId,
+        status: "in_progress" as const,
+        answers: answersToSave,
+        marked_for_review: markedList,
+        visited: visitedList,
+        time_remaining_seconds: Math.max(0, remainingSecs),
+        updated_at: new Date().toISOString(),
+      };
+
+      // 1. Instant fallback in localStorage
+      try {
+        localStorage.setItem(
+          `cbt_session_${examId}_${userId}`,
+          JSON.stringify(sessionPayload)
+        );
+      } catch (err) {
+        console.warn("Could not cache test session in localStorage:", err);
+      }
+
+      // 2. Upsert to public.test_sessions
+      try {
+        const { error: sessErr } = await supabase
+          .from("test_sessions")
+          .upsert(sessionPayload, { onConflict: "user_id,exam_id" });
+
+        if (sessErr) {
+          console.warn("Auto-save to test_sessions notice:", sessErr.message);
+        }
+      } catch (err) {
+        console.warn("Error upserting to test_sessions:", err);
+      }
+
+      // 3. Keep public.submissions updated in parallel for backward compatibility
+      try {
+        await supabase
+          .from("submissions")
+          .update({ answers: answersToSave })
+          .eq("user_id", userId)
+          .eq("exam_id", examId);
+      } catch (e) {
+        console.warn("Submissions answers sync notice:", e);
+      }
+    },
+    [userId, examId, supabase]
+  );
+
+  // Final Exam Submission & Evaluation
+        const handleFinalSubmit = useCallback(async () => {
+    if (isFinalizing.current) return;
+    isFinalizing.current = true;
+    setIsSubmitting(true);
+
+    const { data: { user } } = await supabase.auth.getUser();
+    const currentUserId = userId || user?.id;
+
+    if (!currentUserId) {
+      setIsSubmitting(false);
+      isFinalizing.current = false;
+      return;
+    }
+
+    let correctCount = 0;
+    let incorrectCount = 0;
+    let unattemptedCount = 0;
+    let totalScore = 0;
+
+    questions.forEach((q) => {
+      const studentAns = candidateAnswers[q.id];
+
+      if (!studentAns || !studentAns.selected_answer) {
+        unattemptedCount++;
+      } else {
+        const given = String(studentAns.selected_answer).trim().toUpperCase();
+        const correct = String(q.correct_answer).trim().toUpperCase();
+
+        if (given === correct) {
+          correctCount++;
+          totalScore += Number(q.positive_marks || 4);
+        } else {
+          incorrectCount++;
+          totalScore -= Number(q.negative_marks || 1);
+        }
+      }
+    });
+
+    const { error } = await supabase.from('submissions').upsert({
+      student_id: currentUserId,
+      test_id: examId,
+      total_score: totalScore,
+      correct_count: correctCount,
+      incorrect_count: incorrectCount,
+      unattempted_count: unattemptedCount,
+      answers: candidateAnswers,
+      status: 'completed',
+      submitted_at: new Date().toISOString()
+    }, { onConflict: 'student_id, test_id' });
+
+    if (error) {
+      console.error("Submission error:", error.message);
+      setIsSubmitting(false);
+      isFinalizing.current = false;
+    } else {
+      router.push(`/test/${examId}/result`);
+    }
+  }, [userId, examId, questions, candidateAnswers, router]);
+          const accuracy =
+            correct + incorrect > 0
+              ? Math.round((correct / (correct + incorrect)) * 1000) / 10
+              : 0;
+
+          subjectBreakdownData[subj] = {
+            subject: subj,
+            score,
+            max_marks: maxMarks,
+            correct,
+            incorrect,
+            unattempted,
+            accuracy,
+            time_spent_sec: timeSpent,
+          };
+        });
+
+        // 1. Mark test_sessions as 'submitted'
+        try {
+          await supabase.from("test_sessions").upsert(
+            {
+              user_id: userId,
+              exam_id: examId,
+              status: "submitted",
+              answers: answersToGrade,
+              time_remaining_seconds: 0,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "user_id,exam_id" }
+          );
+        } catch (err) {
+          console.warn("Could not mark test_session as submitted:", err);
+        }
+
+        // 2. Clear localStorage in-progress cache
+        try {
+          localStorage.removeItem(`cbt_session_${examId}_${userId}`);
+        } catch (_) {}
+
+        // 3. Update submissions table for result and admin analytics
+        const updatePayload: Record<string, any> = {
+          status: "completed",
+          end_time: new Date().toISOString(),
+          total_score: calculatedScore,
+          answers: answersToGrade,
+          question_telemetry: telemetryRef.current,
+          subject_breakdown: subjectBreakdownData,
+        };
+
+        let { error: subUpdateError } = await supabase
+          .from("submissions")
+          .update(updatePayload)
+          .eq("user_id", userId)
+          .eq("exam_id", examId);
+
+        // Safe fallback if telemetry columns not yet created in remote DB
+        if (
+          subUpdateError &&
+          (subUpdateError.message.includes("question_telemetry") ||
+            subUpdateError.message.includes("subject_breakdown"))
+        ) {
+          console.warn(
+            "Columns not found in submissions table, saving without telemetry:",
+            subUpdateError.message
+          );
+          const { question_telemetry, subject_breakdown, ...fallbackPayload } = updatePayload;
+          await supabase
+            .from("submissions")
+            .update(fallbackPayload)
+            .eq("user_id", userId)
+            .eq("exam_id", examId);
+        }
+
+        // LocalStorage cache for instant results view
+        try {
+          localStorage.setItem(
+            `cbt_telemetry_${examId}_${userId}`,
+            JSON.stringify({
+              question_telemetry: telemetryRef.current,
+              subject_breakdown: subjectBreakdownData,
+            })
+          );
+        } catch (e) {
+          console.warn("Could not cache telemetry in localStorage:", e);
+        }
+
+        router.push(`/test/${examId}/result`);
+      } catch (err) {
+        console.error("Submission error:", err);
+        router.push(`/test/${examId}/result`);
+      } finally {
+        setIsSubmitting(false);
+      }
+    },
+    [userId, examId, exam, questions, supabase, router, flushActiveQuestionTime]
+  );
+
+  const handleFinalSubmitRef = useRef(handleFinalSubmit);
+  useEffect(() => {
+    handleFinalSubmitRef.current = handleFinalSubmit;
+  }, [handleFinalSubmit]);
+
+  // Load Exam, Questions, and Hydrate Session (test_sessions & submissions)
   useEffect(() => {
     let ignore = false;
     async function init() {
@@ -343,6 +601,7 @@ function ExamSessionContent() {
         if (!ignore && examData) {
           setExam(examData);
           setSecondsRemaining(examData.duration_minutes * 60);
+          secondsRemainingRef.current = examData.duration_minutes * 60;
         }
 
         const { data: qData } = await supabase
@@ -354,6 +613,36 @@ function ExamSessionContent() {
         if (!ignore && qData) {
           setQuestions(qData);
 
+          // 1. Check if an active or submitted test_sessions entry exists
+          let sessionData: any = null;
+          try {
+            const { data: dbSession, error: sessErr } = await supabase
+              .from("test_sessions")
+              .select("*")
+              .eq("user_id", user.id)
+              .eq("exam_id", examId)
+              .maybeSingle();
+
+            if (!sessErr && dbSession) {
+              sessionData = dbSession;
+            }
+          } catch (e) {
+            console.warn("test_sessions query notice:", e);
+          }
+
+          // Check localStorage fallback
+          if (!sessionData && typeof window !== "undefined") {
+            try {
+              const raw = localStorage.getItem(`cbt_session_${examId}_${user.id}`);
+              if (raw) {
+                sessionData = JSON.parse(raw);
+              }
+            } catch (e) {
+              console.warn("localStorage session read notice:", e);
+            }
+          }
+
+          // 2. Check public.submissions for already completed exam
           const { data: subData } = await supabase
             .from("submissions")
             .select("*")
@@ -361,13 +650,9 @@ function ExamSessionContent() {
             .eq("exam_id", examId)
             .maybeSingle();
 
-          if (subData?.status === "completed") {
+          if (sessionData?.status === "submitted" || subData?.status === "completed") {
             router.push(`/test/${examId}/result`);
             return;
-          }
-
-          if (subData?.answers && typeof subData.answers === "object") {
-            setCandidateAnswers(subData.answers as Record<string, CandidateAnswer>);
           }
 
           if (subData?.question_telemetry && typeof subData.question_telemetry === "object") {
@@ -381,12 +666,87 @@ function ExamSessionContent() {
             subjectVisitOrderRef.current = [...subData.subject_breakdown.subject_visit_order];
           }
 
-          if (subData?.start_time && examData) {
-            const elapsedSeconds = Math.floor(
-              (new Date().getTime() - new Date(subData.start_time).getTime()) / 1000
-            );
-            const remaining = Math.max(0, examData.duration_minutes * 60 - elapsedSeconds);
-            setSecondsRemaining(remaining);
+          // Hydrate from test_sessions if in progress
+          if (sessionData && sessionData.status === "in_progress") {
+            const savedSecs =
+              typeof sessionData.time_remaining_seconds === "number"
+                ? sessionData.time_remaining_seconds
+                : examData
+                ? examData.duration_minutes * 60
+                : 180 * 60;
+
+            if (savedSecs <= 0) {
+              console.log("Timer expired in saved session. Auto-submitting...");
+              const finalAns =
+                sessionData.answers && typeof sessionData.answers === "object"
+                  ? (sessionData.answers as Record<string, CandidateAnswer>)
+                  : {};
+              await handleFinalSubmitRef.current(finalAns);
+              return;
+            }
+
+            // Hydrate remaining timer
+            setSecondsRemaining(savedSecs);
+            secondsRemainingRef.current = savedSecs;
+
+            // Hydrate candidate answers, marked_for_review, and visited
+            let hydratedAnswers: Record<string, CandidateAnswer> = {};
+            if (sessionData.answers && typeof sessionData.answers === "object") {
+              hydratedAnswers = { ...sessionData.answers };
+            }
+
+            if (Array.isArray(sessionData.visited)) {
+              sessionData.visited.forEach((qId: string) => {
+                if (!hydratedAnswers[qId]) {
+                  hydratedAnswers[qId] = {
+                    question_id: qId,
+                    selected_answer: null,
+                    status: "not_answered",
+                  };
+                }
+              });
+            }
+
+            if (Array.isArray(sessionData.marked_for_review)) {
+              sessionData.marked_for_review.forEach((qId: string) => {
+                if (hydratedAnswers[qId]) {
+                  hydratedAnswers[qId].status = hydratedAnswers[qId].selected_answer
+                    ? "answered_and_marked_for_review"
+                    : "marked_for_review";
+                } else {
+                  hydratedAnswers[qId] = {
+                    question_id: qId,
+                    selected_answer: null,
+                    status: "marked_for_review",
+                  };
+                }
+              });
+            }
+
+            setCandidateAnswers(hydratedAnswers);
+            candidateAnswersRef.current = hydratedAnswers;
+          } else if (subData) {
+            // Fallback to submissions record if test_sessions row wasn't present
+            if (subData.answers && typeof subData.answers === "object") {
+              setCandidateAnswers(subData.answers as Record<string, CandidateAnswer>);
+              candidateAnswersRef.current = subData.answers as Record<string, CandidateAnswer>;
+            }
+
+            if (subData.start_time && examData) {
+              const elapsedSeconds = Math.floor(
+                (new Date().getTime() - new Date(subData.start_time).getTime()) / 1000
+              );
+              const remaining = Math.max(0, examData.duration_minutes * 60 - elapsedSeconds);
+              setSecondsRemaining(remaining);
+              secondsRemainingRef.current = remaining;
+
+              if (remaining <= 0) {
+                await handleFinalSubmitRef.current(
+                  (subData.answers as Record<string, CandidateAnswer>) || {}
+                );
+                return;
+              }
+            }
           }
         }
       } catch (err) {
@@ -454,206 +814,26 @@ function ExamSessionContent() {
         setCandidateAnswers((prev) => {
           const qStatus = prev[targetQ.id]?.status;
           if (!qStatus || qStatus === "not_visited") {
-            return {
+            const updated = {
               ...prev,
               [targetQ.id]: {
                 question_id: targetQ.id,
                 selected_answer: null,
-                status: "not_answered",
+                status: "not_answered" as const,
               },
             };
+            candidateAnswersRef.current = updated;
+            persistSessionProgress(updated, secondsRemainingRef.current);
+            return updated;
           }
           return prev;
         });
       }
     },
-    [sectionQuestions]
+    [sectionQuestions, persistSessionProgress]
   );
 
-  const syncAnswersToDb = useCallback(
-    async (updatedAnswers: Record<string, CandidateAnswer>) => {
-      if (!userId || !examId) return;
-      try {
-        await supabase
-          .from("submissions")
-          .update({ answers: updatedAnswers })
-          .eq("user_id", userId)
-          .eq("exam_id", examId);
-      } catch (e) {
-        console.warn("Auto-sync error:", e);
-      }
-    },
-    [userId, examId, supabase]
-  );
-
-  const handleFinalSubmit = useCallback(async () => {
-    if (isFinalizing.current) return;
-    isFinalizing.current = true;
-    setIsSubmitting(true);
-
-    try {
-      if (!userId || !examId || !exam) {
-        router.push(`/test/${examId}/result`);
-        return;
-      }
-
-      flushActiveQuestionTime();
-
-      let calculatedScore = 0;
-      questions.forEach((q) => {
-        const candidateResp = candidateAnswers[q.id];
-        if (
-          candidateResp &&
-          (candidateResp.status === "answered" ||
-            candidateResp.status === "answered_and_marked_for_review") &&
-          candidateResp.selected_answer
-        ) {
-          const isCorrect =
-            q.type === "mcq"
-              ? candidateResp.selected_answer.trim().toUpperCase() ===
-                q.correct_answer.trim().toUpperCase()
-              : candidateResp.selected_answer.trim() === q.correct_answer.trim();
-
-          if (isCorrect) {
-            calculatedScore += q.positive_marks ?? 4;
-          } else {
-            if (exam.has_negative_marking) {
-              calculatedScore -= q.negative_marks ?? 1;
-            }
-          }
-        }
-      });
-
-      // Compute granular per-subject breakdown
-      const subjects: Subject[] = ["physics", "chemistry", "mathematics"];
-      const subjectBreakdownData: Record<string, any> = {
-        subject_visit_order: subjectVisitOrderRef.current,
-      };
-
-      subjects.forEach((subj) => {
-        const subjQuestions = questions.filter((q) => q.subject === subj);
-        let score = 0;
-        let correct = 0;
-        let incorrect = 0;
-        let unattempted = 0;
-        let timeSpent = 0;
-        let maxMarks = 0;
-
-        subjQuestions.forEach((q) => {
-          maxMarks += q.positive_marks ?? 4;
-          const t = telemetryRef.current[q.id];
-          if (t) timeSpent += t.time_spent_sec || 0;
-
-          const candidateResp = candidateAnswers[q.id];
-          const isAttempted =
-            candidateResp &&
-            (candidateResp.status === "answered" ||
-              candidateResp.status === "answered_and_marked_for_review") &&
-            Boolean(candidateResp.selected_answer);
-
-          if (isAttempted && candidateResp.selected_answer) {
-            const isCorrect =
-              q.type === "mcq"
-                ? candidateResp.selected_answer.trim().toUpperCase() ===
-                  q.correct_answer.trim().toUpperCase()
-                : candidateResp.selected_answer.trim() === q.correct_answer.trim();
-
-            if (isCorrect) {
-              correct++;
-              score += q.positive_marks ?? 4;
-            } else {
-              incorrect++;
-              if (exam.has_negative_marking) {
-                score -= q.negative_marks ?? 1;
-              }
-            }
-          } else {
-            unattempted++;
-          }
-        });
-
-        const accuracy =
-          correct + incorrect > 0
-            ? Math.round((correct / (correct + incorrect)) * 1000) / 10
-            : 0;
-
-        subjectBreakdownData[subj] = {
-          subject: subj,
-          score,
-          max_marks: maxMarks,
-          correct,
-          incorrect,
-          unattempted,
-          accuracy,
-          time_spent_sec: timeSpent,
-        };
-      });
-
-      const updatePayload: Record<string, any> = {
-        status: "completed",
-        end_time: new Date().toISOString(),
-        total_score: calculatedScore,
-        answers: candidateAnswers,
-        question_telemetry: telemetryRef.current,
-        subject_breakdown: subjectBreakdownData,
-      };
-
-      let { error: subUpdateError } = await supabase
-        .from("submissions")
-        .update(updatePayload)
-        .eq("user_id", userId)
-        .eq("exam_id", examId);
-
-      // Safe fallback if telemetry columns not yet created in remote DB
-      if (
-        subUpdateError &&
-        (subUpdateError.message.includes("question_telemetry") ||
-          subUpdateError.message.includes("subject_breakdown"))
-      ) {
-        console.warn(
-          "Columns not found in submissions table, saving without telemetry:",
-          subUpdateError.message
-        );
-        const { question_telemetry, subject_breakdown, ...fallbackPayload } = updatePayload;
-        await supabase
-          .from("submissions")
-          .update(fallbackPayload)
-          .eq("user_id", userId)
-          .eq("exam_id", examId);
-      }
-
-      // LocalStorage cache for instant results view
-      try {
-        localStorage.setItem(
-          `cbt_telemetry_${examId}_${userId}`,
-          JSON.stringify({
-            question_telemetry: telemetryRef.current,
-            subject_breakdown: subjectBreakdownData,
-          })
-        );
-      } catch (e) {
-        console.warn("Could not cache telemetry in localStorage:", e);
-      }
-
-      router.push(`/test/${examId}/result`);
-    } catch (err) {
-      console.error("Submission error:", err);
-      router.push(`/test/${examId}/result`);
-    } finally {
-      setIsSubmitting(false);
-    }
-  }, [
-    userId,
-    examId,
-    exam,
-    questions,
-    candidateAnswers,
-    supabase,
-    router,
-    flushActiveQuestionTime,
-  ]);
-
-  // Countdown Timer
+  // Countdown Timer with 15-second periodic auto-save
   useEffect(() => {
     if (!timerInitialized) return;
 
@@ -669,12 +849,21 @@ function ExamSessionContent() {
           handleFinalSubmit();
           return 0;
         }
-        return prev - 1;
+
+        const nextSecs = prev - 1;
+        secondsRemainingRef.current = nextSecs;
+
+        // Auto-save progress every 15 seconds
+        if (nextSecs > 0 && nextSecs % 15 === 0) {
+          persistSessionProgress(candidateAnswersRef.current, nextSecs);
+        }
+
+        return nextSecs;
       });
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [secondsRemaining, timerInitialized, handleFinalSubmit]);
+  }, [timerInitialized, handleFinalSubmit, persistSessionProgress]);
 
   const formatTimer = (secs: number) => {
     const hours = Math.floor(secs / 3600);
@@ -724,7 +913,8 @@ function ExamSessionContent() {
       },
     };
     setCandidateAnswers(updated);
-    syncAnswersToDb(updated);
+    candidateAnswersRef.current = updated;
+    persistSessionProgress(updated, secondsRemainingRef.current);
 
     if (currentQuestionIndex < sectionQuestions.length - 1) {
       selectQuestion(currentQuestionIndex + 1);
@@ -747,7 +937,8 @@ function ExamSessionContent() {
       },
     };
     setCandidateAnswers(updated);
-    syncAnswersToDb(updated);
+    candidateAnswersRef.current = updated;
+    persistSessionProgress(updated, secondsRemainingRef.current);
 
     if (currentQuestionIndex < sectionQuestions.length - 1) {
       selectQuestion(currentQuestionIndex + 1);
@@ -771,7 +962,8 @@ function ExamSessionContent() {
       },
     };
     setCandidateAnswers(updated);
-    syncAnswersToDb(updated);
+    candidateAnswersRef.current = updated;
+    persistSessionProgress(updated, secondsRemainingRef.current);
 
     if (currentQuestionIndex < sectionQuestions.length - 1) {
       selectQuestion(currentQuestionIndex + 1);
@@ -795,7 +987,8 @@ function ExamSessionContent() {
       },
     };
     setCandidateAnswers(updated);
-    syncAnswersToDb(updated);
+    candidateAnswersRef.current = updated;
+    persistSessionProgress(updated, secondsRemainingRef.current);
   };
 
   // Palette Status Counters
@@ -816,6 +1009,43 @@ function ExamSessionContent() {
     });
 
     return { answered, notAnswered, marked, answeredAndMarked, notVisited };
+  }, [questions, candidateAnswers]);
+
+  // Section Breakdown Summary for Confirmation Modal
+  const sectionSummary = useMemo(() => {
+    const subjects: Subject[] = ["physics", "chemistry", "mathematics"];
+    return subjects.map((subj) => {
+      const subjQuestions = questions.filter((q) => q.subject === subj);
+      let answered = 0;
+      let notAnswered = 0;
+      let marked = 0;
+      let notVisited = 0;
+
+      subjQuestions.forEach((q) => {
+        const state = candidateAnswers[q.id]?.status ?? "not_visited";
+        if (state === "answered" || state === "answered_and_marked_for_review") {
+          answered++;
+        }
+        if (state === "not_answered") {
+          notAnswered++;
+        }
+        if (state === "marked_for_review" || state === "answered_and_marked_for_review") {
+          marked++;
+        }
+        if (state === "not_visited") {
+          notVisited++;
+        }
+      });
+
+      return {
+        subject: subj,
+        total: subjQuestions.length,
+        answered,
+        notAnswered,
+        marked,
+        notVisited,
+      };
+    });
   }, [questions, candidateAnswers]);
 
   const getPaletteBadgeClass = (qId: string) => {
@@ -1056,78 +1286,153 @@ function ExamSessionContent() {
         )}
       </div>
 
-      {/* Confirmation Modal */}
+      {/* Submit Confirmation Modal (Prevent Accidental Submission) */}
       {showSubmitModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="w-full max-w-lg rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl p-6 sm:p-8 space-y-6">
-            <div className="text-center space-y-2">
-              <div className="w-12 h-12 rounded-2xl bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center justify-center mx-auto">
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="w-full max-w-2xl rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl p-6 sm:p-8 space-y-6">
+            <div className="flex items-start gap-4">
+              <div className="w-12 h-12 rounded-2xl bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center justify-center shrink-0">
                 <CheckCircle2 className="w-6 h-6" />
               </div>
-              <h2 className="text-xl font-bold text-white">Confirm Final Submission</h2>
-              <p className="text-xs text-slate-400">
-                Please review your exam attempt summary before submitting.
-              </p>
+              <div className="space-y-1">
+                <h2 className="text-xl font-bold text-white tracking-tight">
+                  Examination Submission Summary
+                </h2>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Please review your attempt breakdown across all sections before submitting. Once confirmed, your answers are locked and final evaluation will occur immediately.
+                </p>
+              </div>
             </div>
 
-            {/* Attempt Summary */}
-            <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 text-xs space-y-2">
-              <div className="flex items-center justify-between py-1 border-b border-slate-800/80 text-slate-300">
-                <span>Total Questions in Paper:</span>
-                <span className="font-bold text-white">{questions.length}</span>
+            {/* Overall Summary KPI Cards */}
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center">
+                <div className="text-[10px] uppercase font-bold text-slate-500">Total Qs</div>
+                <div className="text-xl font-black text-white mt-0.5">{questions.length}</div>
               </div>
-              <div className="flex items-center justify-between py-1 border-b border-slate-800/80 text-emerald-400">
-                <span>Answered:</span>
-                <span className="font-bold">{paletteStats.answered}</span>
+              <div className="p-3 rounded-xl bg-emerald-950/30 border border-emerald-500/30 text-center">
+                <div className="text-[10px] uppercase font-bold text-emerald-400">Answered</div>
+                <div className="text-xl font-black text-emerald-400 mt-0.5">
+                  {paletteStats.answered + paletteStats.answeredAndMarked}
+                </div>
               </div>
-              <div className="flex items-center justify-between py-1 border-b border-slate-800/80 text-red-400">
-                <span>Not Answered:</span>
-                <span className="font-bold">{paletteStats.notAnswered}</span>
+              <div className="p-3 rounded-xl bg-red-950/30 border border-red-500/30 text-center">
+                <div className="text-[10px] uppercase font-bold text-red-400">Not Answered</div>
+                <div className="text-xl font-black text-red-400 mt-0.5">
+                  {paletteStats.notAnswered}
+                </div>
               </div>
-              <div className="flex items-center justify-between py-1 border-b border-slate-800/80 text-purple-400">
-                <span>Marked for Review:</span>
-                <span className="font-bold">
+              <div className="p-3 rounded-xl bg-purple-950/30 border border-purple-500/30 text-center">
+                <div className="text-[10px] uppercase font-bold text-purple-400">Marked Review</div>
+                <div className="text-xl font-black text-purple-400 mt-0.5">
                   {paletteStats.marked + paletteStats.answeredAndMarked}
-                </span>
+                </div>
               </div>
-              <div className="flex items-center justify-between py-1 text-slate-400">
-                <span>Not Visited:</span>
-                <span className="font-bold">{paletteStats.notVisited}</span>
+              <div className="col-span-2 sm:col-span-1 p-3 rounded-xl bg-slate-950 border border-slate-800 text-center">
+                <div className="text-[10px] uppercase font-bold text-slate-400">Not Visited</div>
+                <div className="text-xl font-black text-slate-300 mt-0.5">
+                  {paletteStats.notVisited}
+                </div>
               </div>
             </div>
 
-            <div className="text-[11px] text-amber-400/90 bg-amber-500/10 border border-amber-500/20 p-3 rounded-xl flex items-start gap-2">
-              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-              <span>
-                Once submitted, you will not be able to change your answers. Your scorecard will be
-                generated immediately.
-              </span>
+            {/* Detailed Progress Table */}
+            <div className="rounded-xl border border-slate-800 overflow-hidden bg-slate-950">
+              <table className="w-full text-xs text-left">
+                <thead className="bg-slate-900/90 text-slate-400 uppercase tracking-wider text-[10px] border-b border-slate-800 font-bold">
+                  <tr>
+                    <th className="py-2.5 px-3.5">Section Name</th>
+                    <th className="py-2.5 px-3 text-center">Total</th>
+                    <th className="py-2.5 px-3 text-center text-emerald-400">Answered</th>
+                    <th className="py-2.5 px-3 text-center text-red-400">Not Answered</th>
+                    <th className="py-2.5 px-3 text-center text-purple-400">Marked Review</th>
+                    <th className="py-2.5 px-3 text-center text-slate-400">Not Visited</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/80 font-mono">
+                  {sectionSummary.map((sec) => (
+                    <tr key={sec.subject} className="hover:bg-slate-900/40 transition">
+                      <td className="py-2.5 px-3.5 capitalize font-sans font-semibold text-white">
+                        {sec.subject}
+                      </td>
+                      <td className="py-2.5 px-3 text-center text-slate-300">{sec.total}</td>
+                      <td className="py-2.5 px-3 text-center font-bold text-emerald-400">
+                        {sec.answered}
+                      </td>
+                      <td className="py-2.5 px-3 text-center font-bold text-red-400">
+                        {sec.notAnswered}
+                      </td>
+                      <td className="py-2.5 px-3 text-center font-bold text-purple-400">
+                        {sec.marked}
+                      </td>
+                      <td className="py-2.5 px-3 text-center text-slate-400">
+                        {sec.notVisited}
+                      </td>
+                    </tr>
+                  ))}
+                  {/* Overall Total Row */}
+                  <tr className="bg-slate-900/80 font-bold border-t-2 border-slate-800">
+                    <td className="py-2.5 px-3.5 font-sans text-white uppercase tracking-wider">
+                      Overall Total
+                    </td>
+                    <td className="py-2.5 px-3 text-center text-white">{questions.length}</td>
+                    <td className="py-2.5 px-3 text-center text-emerald-400">
+                      {paletteStats.answered + paletteStats.answeredAndMarked}
+                    </td>
+                    <td className="py-2.5 px-3 text-center text-red-400">
+                      {paletteStats.notAnswered}
+                    </td>
+                    <td className="py-2.5 px-3 text-center text-purple-400">
+                      {paletteStats.marked + paletteStats.answeredAndMarked}
+                    </td>
+                    <td className="py-2.5 px-3 text-center text-slate-400">
+                      {paletteStats.notVisited}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            {/* Warning Callout */}
+            <div className="text-xs text-amber-300/90 bg-amber-500/10 border border-amber-500/25 p-3.5 rounded-xl flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div className="space-y-0.5 leading-relaxed">
+                <span className="font-semibold text-amber-200">
+                  Are you sure you want to submit your final paper?
+                </span>
+                <p className="text-[11px] text-amber-300/80">
+                  After clicking &quot;Confirm &amp; Submit Final Paper&quot;, your test session will be marked as submitted. No further modifications to your answers are permitted.
+                </p>
+              </div>
             </div>
 
             {/* Modal Actions */}
-            <div className="flex items-center justify-end gap-3 pt-2">
+            <div className="flex flex-col sm:flex-row items-center justify-end gap-3 pt-2">
               <button
                 type="button"
                 onClick={() => setShowSubmitModal(false)}
                 disabled={isSubmitting}
-                className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition cursor-pointer"
+                className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-semibold transition border border-slate-700/60 cursor-pointer disabled:opacity-50"
               >
-                Return to Exam
+                Cancel / Return to Test
               </button>
 
               <button
                 type="button"
-                onClick={handleFinalSubmit}
+                onClick={() => handleFinalSubmit()}
                 disabled={isSubmitting}
-                className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-xs transition shadow-lg shadow-blue-500/25 active:scale-[0.99] disabled:opacity-50 cursor-pointer flex items-center gap-2"
+                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-xs transition shadow-lg shadow-blue-500/25 active:scale-[0.99] disabled:opacity-50 cursor-pointer flex items-center justify-center gap-2"
               >
                 {isSubmitting ? (
                   <>
                     <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                    <span>Calculating Score...</span>
+                    <span>Grading &amp; Submitting Final Paper...</span>
                   </>
                 ) : (
-                  <span>Submit Final Exam</span>
+                  <>
+                    <CheckCircle2 className="w-4 h-4 text-white" />
+                    <span>Confirm &amp; Submit Final Paper</span>
+                  </>
                 )}
               </button>
             </div>

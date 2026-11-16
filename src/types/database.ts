@@ -95,3 +95,17 @@ export interface Submission {
   profiles?: Profile;
 }
 
+export interface TestSession {
+  id?: string;
+  user_id: string;
+  exam_id: string;
+  status: "in_progress" | "submitted";
+  answers: Record<string, CandidateAnswer>;
+  marked_for_review?: string[];
+  visited?: string[];
+  time_remaining_seconds: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+

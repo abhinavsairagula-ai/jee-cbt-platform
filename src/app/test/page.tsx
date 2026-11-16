@@ -18,7 +18,13 @@ import {
   ShieldCheck,
   Eye,
   FileEdit,
+  RotateCcw,
 } from "lucide-react";
+
+interface UserSessionInfo {
+  status: "in_progress" | "submitted";
+  time_remaining_seconds: number;
+}
 
 export default function CandidateTestPortalPage() {
   const [supabase] = useState(() => createClient());
@@ -29,6 +35,7 @@ export default function CandidateTestPortalPage() {
   const [userRole, setUserRole] = useState<string | null>(null);
   const [adminShowDrafts, setAdminShowDrafts] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [userSessions, setUserSessions] = useState<Record<string, UserSessionInfo>>({});
 
   const loadExams = useCallback(
     async (showDrafts = false, isManualRefresh = false) => {
@@ -51,6 +58,75 @@ export default function CandidateTestPortalPage() {
             .single();
           currentRole = profile?.role ?? "candidate";
           setUserRole(currentRole);
+
+          // Fetch active / submitted sessions for this candidate
+          const sessionsMap: Record<string, UserSessionInfo> = {};
+
+          try {
+            const { data: sessData, error: sessErr } = await supabase
+              .from("test_sessions")
+              .select("exam_id, status, time_remaining_seconds")
+              .eq("user_id", user.id);
+
+            if (!sessErr && sessData) {
+              sessData.forEach((s) => {
+                sessionsMap[s.exam_id] = {
+                  status: s.status as "in_progress" | "submitted",
+                  time_remaining_seconds: s.time_remaining_seconds ?? 0,
+                };
+              });
+            }
+          } catch (e) {
+            console.warn("Could not load user test_sessions:", e);
+          }
+
+          // Fallback: check public.submissions
+          try {
+            const { data: subData } = await supabase
+              .from("submissions")
+              .select("exam_id, status")
+              .eq("user_id", user.id);
+
+            if (subData) {
+              subData.forEach((sub) => {
+                if (!sessionsMap[sub.exam_id]) {
+                  sessionsMap[sub.exam_id] = {
+                    status: sub.status === "in_progress" ? "in_progress" : "submitted",
+                    time_remaining_seconds: 0,
+                  };
+                }
+              });
+            }
+          } catch (e) {
+            console.warn("Submissions check notice:", e);
+          }
+
+          // Fallback: check localStorage for any local active session
+          if (typeof window !== "undefined") {
+            try {
+              for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key?.startsWith("cbt_session_") && key.endsWith(`_${user.id}`)) {
+                  const parts = key.split("_");
+                  const eId = parts[2];
+                  if (eId && !sessionsMap[eId]) {
+                    const raw = localStorage.getItem(key);
+                    if (raw) {
+                      const parsed = JSON.parse(raw);
+                      if (parsed?.status === "in_progress") {
+                        sessionsMap[eId] = {
+                          status: "in_progress",
+                          time_remaining_seconds: parsed.time_remaining_seconds ?? 0,
+                        };
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (_) {}
+          }
+
+          setUserSessions(sessionsMap);
         }
 
         // Build query: If admin and adminShowDrafts is active, fetch all exams; otherwise fetch is_active = true
@@ -274,64 +350,109 @@ export default function CandidateTestPortalPage() {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {exams.map((exam) => (
-              <div
-                key={exam.id}
-                className="rounded-2xl bg-slate-900 border border-slate-800 hover:border-blue-500/40 transition p-6 flex flex-col justify-between space-y-5 shadow-lg group"
-              >
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    {exam.is_active ? (
-                      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                        <CheckCircle className="w-3 h-3" />
-                        <span>Ready for Testing</span>
+            {exams.map((exam) => {
+              const session = userSessions[exam.id];
+              const isInProgress = session?.status === "in_progress";
+              const isCompleted = session?.status === "submitted";
+
+              return (
+                <div
+                  key={exam.id}
+                  className={`rounded-2xl bg-slate-900 border transition p-6 flex flex-col justify-between space-y-5 shadow-lg group ${
+                    isInProgress
+                      ? "border-amber-500/50 shadow-amber-500/10 ring-1 ring-amber-500/30"
+                      : "border-slate-800 hover:border-blue-500/40"
+                  }`}
+                >
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      {isInProgress ? (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30 animate-pulse">
+                          <RotateCcw className="w-3 h-3 text-amber-400" />
+                          <span>In Progress</span>
+                        </span>
+                      ) : isCompleted ? (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-500/15 text-blue-300 border border-blue-500/30">
+                          <CheckCircle className="w-3 h-3 text-blue-400" />
+                          <span>Submitted</span>
+                        </span>
+                      ) : exam.is_active ? (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                          <CheckCircle className="w-3 h-3 text-emerald-400" />
+                          <span>Ready for Testing</span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                          <FileEdit className="w-3 h-3 text-amber-400" />
+                          <span>Draft (Admin Preview)</span>
+                        </span>
+                      )}
+                      <span className="text-xs text-slate-400 font-mono">
+                        {exam.questions_count ?? 0} Questions
                       </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                        <FileEdit className="w-3 h-3" />
-                        <span>Draft (Admin Preview)</span>
-                      </span>
+                    </div>
+
+                    <h3 className="text-lg font-bold text-white group-hover:text-blue-400 transition leading-snug">
+                      {exam.title}
+                    </h3>
+
+                    {exam.description && (
+                      <p className="text-xs text-slate-400 line-clamp-2">{exam.description}</p>
                     )}
-                    <span className="text-xs text-slate-400 font-mono">
-                      {exam.questions_count ?? 0} Questions
-                    </span>
-                  </div>
 
-                  <h3 className="text-lg font-bold text-white group-hover:text-blue-400 transition leading-snug">
-                    {exam.title}
-                  </h3>
-
-                  {exam.description && (
-                    <p className="text-xs text-slate-400 line-clamp-2">{exam.description}</p>
-                  )}
-
-                  <div className="grid grid-cols-2 gap-2 pt-2 border-t border-slate-800/80 text-xs text-slate-400">
-                    <div className="flex items-center gap-1.5">
-                      <Clock className="w-3.5 h-3.5 text-cyan-400" />
-                      <span>{exam.duration_minutes} Mins</span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <Award className="w-3.5 h-3.5 text-amber-400" />
-                      <span>{exam.total_marks} Marks</span>
-                    </div>
-                    <div className="col-span-2 text-[11px] text-slate-500">
-                      Marking: +{exam.positive_marks} / -{exam.negative_marks}{" "}
-                      {exam.has_negative_marking ? "(Negative Marking)" : "(No Negative Marking)"}
+                    <div className="grid grid-cols-2 gap-2 pt-2 border-t border-slate-800/80 text-xs text-slate-400">
+                      <div className="flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>{exam.duration_minutes} Mins</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <Award className="w-3.5 h-3.5 text-amber-400" />
+                        <span>{exam.total_marks} Marks</span>
+                      </div>
+                      <div className="col-span-2 text-[11px] text-slate-500">
+                        Marking: +{exam.positive_marks} / -{exam.negative_marks}{" "}
+                        {exam.has_negative_marking ? "(Negative Marking)" : "(No Negative Marking)"}
+                      </div>
                     </div>
                   </div>
-                </div>
 
-                <div className="pt-3 border-t border-slate-800/80">
-                  <Link
-                    href={`/test/${exam.id}`}
-                    className="w-full inline-flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold text-xs transition shadow-lg shadow-blue-500/25 active:scale-[0.99]"
-                  >
-                    <span>Instructions & Start Test</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </Link>
+                  <div className="pt-3 border-t border-slate-800/80">
+                    {isInProgress ? (
+                      <Link
+                        href={`/test/${exam.id}/session`}
+                        className="w-full inline-flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-gradient-to-r from-amber-600 via-orange-600 to-amber-500 hover:from-amber-500 hover:to-orange-500 text-white font-bold text-xs transition shadow-lg shadow-amber-500/25 active:scale-[0.99] cursor-pointer"
+                      >
+                        <RotateCcw className="w-4 h-4" />
+                        <span>Resume Test</span>
+                        {session.time_remaining_seconds > 0 && (
+                          <span className="ml-1 opacity-90 font-mono text-[11px]">
+                            ({Math.ceil(session.time_remaining_seconds / 60)}m left)
+                          </span>
+                        )}
+                        <ArrowRight className="w-4 h-4 ml-0.5" />
+                      </Link>
+                    ) : isCompleted ? (
+                      <Link
+                        href={`/test/${exam.id}/result`}
+                        className="w-full inline-flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white font-semibold text-xs border border-slate-700 transition shadow-sm active:scale-[0.99] cursor-pointer"
+                      >
+                        <Award className="w-4 h-4 text-amber-400" />
+                        <span>View Results &amp; Scorecard</span>
+                        <ArrowRight className="w-4 h-4" />
+                      </Link>
+                    ) : (
+                      <Link
+                        href={`/test/${exam.id}`}
+                        className="w-full inline-flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold text-xs transition shadow-lg shadow-blue-500/25 active:scale-[0.99] cursor-pointer"
+                      >
+                        <span>Instructions &amp; Start Test</span>
+                        <ArrowRight className="w-4 h-4" />
+                      </Link>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </main>

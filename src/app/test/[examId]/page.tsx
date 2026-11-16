@@ -78,7 +78,15 @@ function ExamInstructionsContent() {
         return;
       }
 
-      // Check if an existing in-progress submission exists
+      // Check if an existing in-progress session or submission exists
+      const { data: existingSession } = await supabase
+        .from("test_sessions")
+        .select("id, status")
+        .eq("user_id", user.id)
+        .eq("exam_id", examId)
+        .eq("status", "in_progress")
+        .maybeSingle();
+
       const { data: existingSub } = await supabase
         .from("submissions")
         .select("id, status")
@@ -87,10 +95,29 @@ function ExamInstructionsContent() {
         .eq("status", "in_progress")
         .maybeSingle();
 
-      if (existingSub?.id) {
+      if (existingSession?.id || existingSub?.id) {
         // Resume existing session
         router.push(`/test/${examId}/session`);
         return;
+      }
+
+      // Initialize test session in public.test_sessions
+      try {
+        await supabase.from("test_sessions").upsert(
+          {
+            user_id: user.id,
+            exam_id: examId,
+            status: "in_progress",
+            answers: {},
+            marked_for_review: [],
+            visited: [],
+            time_remaining_seconds: (exam?.duration_minutes ?? 180) * 60,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "user_id,exam_id" }
+        );
+      } catch (sessErr) {
+        console.warn("Could not initialize test_session:", sessErr);
       }
 
       // Create new submission
