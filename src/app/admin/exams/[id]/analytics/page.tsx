@@ -158,45 +158,48 @@ export default function ExamAnalyticsPage() {
         const fetchedQuestions = qData || [];
         setQuestions(fetchedQuestions);
 
+        // Fetch submissions and test_sessions in parallel
+        const [{ data: subData }, { data: sessData }] = await Promise.all([
+          supabase.from("submissions").select("*").or(`exam_id.eq.${examId},test_id.eq.${examId}`),
+          supabase.from("test_sessions").select("*").or(`exam_id.eq.${examId},test_id.eq.${examId}`)
+        ]);
+
+        const sessionMap = new Map();
+        (sessData || []).forEach((s: any) => {
+          sessionMap.set(s.user_id || s.student_id, s.answers || {});
+        });
+
         let fetchedSubmissions: Submission[] = [];
-        
-        const { data: subData } = await supabase
-          .from("submissions")
-          .select("*")
-          .or(`exam_id.eq.${examId},test_id.eq.${examId}`);
-
         if (subData && subData.length > 0) {
-          fetchedSubmissions = subData;
-        }
-
-        const { data: sessData } = await supabase
-          .from("test_sessions")
-          .select("*")
-          .or(`exam_id.eq.${examId},test_id.eq.${examId}`);
-
-        if (sessData && sessData.length > 0) {
-          sessData.forEach((s: any) => {
-            const existingIdx = fetchedSubmissions.findIndex(
-              (sub) => sub.user_id === s.user_id || (sub as any).student_id === s.user_id
-            );
-            if (existingIdx >= 0) {
-              if (!fetchedSubmissions[existingIdx].answers || Object.keys(fetchedSubmissions[existingIdx].answers || {}).length === 0) {
-                fetchedSubmissions[existingIdx].answers = s.answers || {};
-              }
-            } else {
-              fetchedSubmissions.push({
-                id: s.id || `${s.user_id}_${s.exam_id}`,
-                user_id: s.user_id,
-                exam_id: s.exam_id,
-                answers: s.answers || {},
-                status: s.status || "completed",
-                created_at: s.updated_at || new Date().toISOString(),
-                submitted_at: s.updated_at || new Date().toISOString(),
-                total_score: 0,
-              });
-            }
+          fetchedSubmissions = subData.map((sub: any) => {
+            const uId = sub.user_id || sub.student_id;
+            const sessionAnswers = sessionMap.get(uId) || {};
+            const subAnswers = sub.answers || {};
+            const finalAnswers = Object.keys(subAnswers).length > 0 ? subAnswers : sessionAnswers;
+            return {
+              ...sub,
+              answers: finalAnswers,
+            };
           });
         }
+
+        // Add any sessions that don't have a submission record yet
+        (sessData || []).forEach((s: any) => {
+          const uId = s.user_id || s.student_id;
+          const exists = fetchedSubmissions.some((sub: any) => (sub.user_id || sub.student_id) === uId);
+          if (!exists) {
+            fetchedSubmissions.push({
+              id: s.id || `${uId}_${examId}`,
+              user_id: uId,
+              exam_id: examId,
+              answers: s.answers || {},
+              status: s.status || "completed",
+              created_at: s.updated_at || new Date().toISOString(),
+              submitted_at: s.updated_at || new Date().toISOString(),
+              total_score: 0,
+            });
+          }
+        });
 
         setSubmissions(fetchedSubmissions);
 
