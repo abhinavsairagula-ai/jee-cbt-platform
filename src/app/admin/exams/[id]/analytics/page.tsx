@@ -123,17 +123,10 @@ export default function ExamAnalyticsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Active Tab: 'cohort' | 'leaderboard' | 'questions'
   const [activeTab, setActiveTab] = useState<"cohort" | "leaderboard" | "questions">("cohort");
-
-  // Leaderboard search & sort
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState<"rank" | "score" | "accuracy" | "time">("rank");
-
-  // Candidate detail modal
   const [selectedCandidate, setSelectedCandidate] = useState<ProcessedCandidate | null>(null);
-
-  // Question filter in Section 3
   const [questionSubjectFilter, setQuestionSubjectFilter] = useState<"all" | Subject>("all");
 
   const loadData = useCallback(
@@ -144,7 +137,6 @@ export default function ExamAnalyticsPage() {
       setErrorMessage(null);
 
       try {
-        // 1. Fetch Exam
         const { data: examData, error: examError } = await supabase
           .from("exams")
           .select("*")
@@ -156,7 +148,6 @@ export default function ExamAnalyticsPage() {
         }
         setExam(examData);
 
-        // 2. Fetch Questions
         const { data: qData, error: qError } = await supabase
           .from("questions")
           .select("*")
@@ -166,7 +157,6 @@ export default function ExamAnalyticsPage() {
         if (qError) throw new Error(qError.message);
         setQuestions(qData || []);
 
-        // 3. Fetch Completed Submissions
         const { data: subData, error: subError } = await supabase
           .from("submissions")
           .select("*")
@@ -178,7 +168,6 @@ export default function ExamAnalyticsPage() {
         const fetchedSubmissions: Submission[] = subData || [];
         setSubmissions(fetchedSubmissions);
 
-        // 4. Fetch Candidate Profiles for names & emails
         const userIds = Array.from(new Set(fetchedSubmissions.map((s) => s.user_id)));
         if (userIds.length > 0) {
           const { data: profData } = await supabase
@@ -207,7 +196,6 @@ export default function ExamAnalyticsPage() {
     loadData();
   }, [loadData]);
 
-  // Process each candidate submission with score, subject breakdown, and telemetry
   const processedCandidates = useMemo((): ProcessedCandidate[] => {
     if (!exam || questions.length === 0 || submissions.length === 0) return [];
 
@@ -216,13 +204,11 @@ export default function ExamAnalyticsPage() {
       const userName = profile?.full_name || profile?.email?.split("@")[0] || "Candidate";
       const userEmail = profile?.email || `ID: ${sub.user_id.slice(0, 8)}...`;
 
-      // Read or build telemetry
       const telemetry: Record<string, QuestionTelemetry> =
         sub.question_telemetry && typeof sub.question_telemetry === "object"
           ? (sub.question_telemetry as Record<string, QuestionTelemetry>)
           : {};
 
-      // Compute total elapsed time
       let totalTimeSec = 0;
       if (sub.start_time && sub.end_time) {
         totalTimeSec = Math.max(
@@ -233,7 +219,6 @@ export default function ExamAnalyticsPage() {
         totalTimeSec = Object.values(telemetry).reduce((acc, t) => acc + (t.time_spent_sec || 0), 0);
       }
 
-      // Compute or retrieve subject breakdown
       const subjects: Subject[] = ["physics", "chemistry", "mathematics"];
       const existingBreakdown = sub.subject_breakdown || {};
       const breakdownResult: {
@@ -242,36 +227,9 @@ export default function ExamAnalyticsPage() {
         mathematics: SubjectBreakdown;
         subject_visit_order: string[];
       } = {
-        physics: {
-          subject: "physics",
-          score: 0,
-          max_marks: 0,
-          correct: 0,
-          incorrect: 0,
-          unattempted: 0,
-          accuracy: 0,
-          time_spent_sec: 0,
-        },
-        chemistry: {
-          subject: "chemistry",
-          score: 0,
-          max_marks: 0,
-          correct: 0,
-          incorrect: 0,
-          unattempted: 0,
-          accuracy: 0,
-          time_spent_sec: 0,
-        },
-        mathematics: {
-          subject: "mathematics",
-          score: 0,
-          max_marks: 0,
-          correct: 0,
-          incorrect: 0,
-          unattempted: 0,
-          accuracy: 0,
-          time_spent_sec: 0,
-        },
+        physics: { subject: "physics", score: 0, max_marks: 0, correct: 0, incorrect: 0, unattempted: 0, accuracy: 0, time_spent_sec: 0 },
+        chemistry: { subject: "chemistry", score: 0, max_marks: 0, correct: 0, incorrect: 0, unattempted: 0, accuracy: 0, time_spent_sec: 0 },
+        mathematics: { subject: "mathematics", score: 0, max_marks: 0, correct: 0, incorrect: 0, unattempted: 0, accuracy: 0, time_spent_sec: 0 },
         subject_visit_order: existingBreakdown.subject_visit_order || [],
       };
 
@@ -337,7 +295,6 @@ export default function ExamAnalyticsPage() {
             ? Math.round((sCorrect / (sCorrect + sIncorrect)) * 1000) / 10
             : 0;
 
-        // Use saved subject breakdown if present, else computed
         const savedSubj = existingBreakdown[subj];
         breakdownResult[subj] = {
           subject: subj,
@@ -351,16 +308,13 @@ export default function ExamAnalyticsPage() {
         };
       });
 
-      // Overall accuracy
       const overallAccuracy =
         totalCorrect + totalIncorrect > 0
           ? Math.round((totalCorrect / (totalCorrect + totalIncorrect)) * 1000) / 10
           : 0;
 
-      // Starting pattern
       let patternList = breakdownResult.subject_visit_order;
       if (!patternList || patternList.length === 0) {
-        // Fallback: order subjects by time spent descending
         patternList = subjects
           .slice()
           .sort((a, b) => breakdownResult[b].time_spent_sec - breakdownResult[a].time_spent_sec);
@@ -379,7 +333,7 @@ export default function ExamAnalyticsPage() {
 
       return {
         submission: sub,
-        rank: 0, // Assigned below after sort
+        rank: 0,
         userName,
         userEmail,
         totalScore: computedTotalScore,
@@ -395,18 +349,15 @@ export default function ExamAnalyticsPage() {
       };
     });
 
-    // Sort by total score descending, then time taken ascending
     candidates.sort((a, b) => {
       if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
       if (a.totalTimeSec !== b.totalTimeSec) return a.totalTimeSec - b.totalTimeSec;
       return b.accuracy - a.accuracy;
     });
 
-    // Assign 1-based ranks
     return candidates.map((c, idx) => ({ ...c, rank: idx + 1 }));
   }, [exam, questions, submissions, profiles]);
 
-  // Cohort Top KPIs
   const cohortStats = useMemo(() => {
     if (processedCandidates.length === 0 || !exam) {
       return {
@@ -476,7 +427,6 @@ export default function ExamAnalyticsPage() {
     };
   }, [processedCandidates, exam, questions]);
 
-  // Question-Level Analytics Table (Q1..Q75)
   const questionAnalytics = useMemo(() => {
     if (questions.length === 0) return [];
     const n = submissions.length;
@@ -539,7 +489,6 @@ export default function ExamAnalyticsPage() {
     });
   }, [questions, submissions]);
 
-  // Filtered Leaderboard candidates
   const filteredCandidates = useMemo(() => {
     let list = processedCandidates.filter((c) => {
       const q = searchQuery.toLowerCase();
@@ -563,7 +512,6 @@ export default function ExamAnalyticsPage() {
     return list;
   }, [processedCandidates, searchQuery, sortBy]);
 
-  // CSV Export
   const handleExportCSV = () => {
     if (processedCandidates.length === 0 || !exam) {
       alert("No completed submissions available to export.");
@@ -658,7 +606,6 @@ export default function ExamAnalyticsPage() {
 
   return (
     <div className="space-y-8 pb-16">
-      {/* Top Header & Breadcrumb */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div className="space-y-1">
           <div className="flex items-center gap-2 text-xs text-slate-400">
@@ -699,7 +646,6 @@ export default function ExamAnalyticsPage() {
           </p>
         </div>
 
-        {/* Header Action Buttons */}
         <div className="flex flex-wrap items-center gap-2.5">
           <button
             type="button"
@@ -730,7 +676,6 @@ export default function ExamAnalyticsPage() {
         </div>
       </div>
 
-      {/* Error Notice */}
       {errorMessage && (
         <div className="p-4 rounded-xl bg-red-950/60 border border-red-500/30 text-red-200 text-xs flex items-start gap-2.5">
           <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
@@ -738,7 +683,6 @@ export default function ExamAnalyticsPage() {
         </div>
       )}
 
-      {/* Navigation Tabs */}
       <div className="flex items-center gap-2 border-b border-slate-800/80 pb-3">
         <button
           type="button"
@@ -780,14 +724,9 @@ export default function ExamAnalyticsPage() {
         </button>
       </div>
 
-      {/* ========================================================================= */}
-      {/* TAB 1: COHORT OVERVIEW & SUBJECT AVERAGES */}
-      {/* ========================================================================= */}
       {activeTab === "cohort" && (
         <div className="space-y-6">
-          {/* Top KPI Stat Cards */}
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-            {/* Card 1 */}
             <div className="p-5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
               <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
                 <span>Total Attempts</span>
@@ -797,7 +736,6 @@ export default function ExamAnalyticsPage() {
               <div className="text-xs text-slate-500">Completed CBT test papers</div>
             </div>
 
-            {/* Card 2 */}
             <div className="p-5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
               <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
                 <span>Average Score</span>
@@ -814,7 +752,6 @@ export default function ExamAnalyticsPage() {
               </div>
             </div>
 
-            {/* Card 3 */}
             <div className="p-5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
               <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
                 <span>Highest Score</span>
@@ -827,7 +764,6 @@ export default function ExamAnalyticsPage() {
               <div className="text-xs text-slate-500">Rank 1 Benchmark</div>
             </div>
 
-            {/* Card 4 */}
             <div className="p-5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1">
               <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
                 <span>Avg Accuracy</span>
@@ -837,7 +773,6 @@ export default function ExamAnalyticsPage() {
               <div className="text-xs text-slate-500">Correct vs Attempted ratio</div>
             </div>
 
-            {/* Card 5 */}
             <div className="p-5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-1 col-span-2 md:col-span-1">
               <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
                 <span>Avg Test Duration</span>
@@ -850,7 +785,6 @@ export default function ExamAnalyticsPage() {
             </div>
           </div>
 
-          {/* Subject-Wise Cohort Breakdown Section */}
           <div className="p-6 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-5">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
               <div>
@@ -894,7 +828,6 @@ export default function ExamAnalyticsPage() {
                         </span>
                       </div>
 
-                      {/* Subject Metrics Grid */}
                       <div className="grid grid-cols-2 gap-3 pt-2">
                         <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800/80 space-y-0.5">
                           <div className="text-[11px] text-slate-400">Average Score</div>
@@ -925,7 +858,6 @@ export default function ExamAnalyticsPage() {
                       </div>
                     </div>
 
-                    {/* Time share progress bar */}
                     <div className="space-y-1.5 pt-2 border-t border-slate-800/60">
                       <div className="flex items-center justify-between text-xs text-slate-400">
                         <span>Time Share of Total Test</span>
@@ -950,7 +882,6 @@ export default function ExamAnalyticsPage() {
             </div>
           </div>
 
-          {/* Empty state prompt if 0 submissions */}
           {cohortStats.totalAttempts === 0 && (
             <div className="p-12 text-center rounded-2xl bg-slate-900/40 border border-dashed border-slate-800 space-y-3">
               <Users className="w-10 h-10 text-slate-500 mx-auto" />
@@ -964,12 +895,8 @@ export default function ExamAnalyticsPage() {
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* TAB 2: CANDIDATE LEADERBOARD & ATTEMPTING PATTERN */}
-      {/* ========================================================================= */}
       {activeTab === "leaderboard" && (
         <div className="space-y-5">
-          {/* Controls Bar: Search & Sort & Export */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="relative max-w-sm w-full">
               <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500" />
@@ -996,7 +923,6 @@ export default function ExamAnalyticsPage() {
             </div>
           </div>
 
-          {/* Leaderboard Table */}
           {filteredCandidates.length === 0 ? (
             <div className="p-12 text-center rounded-2xl bg-slate-900/40 border border-dashed border-slate-800 space-y-2">
               <Trophy className="w-8 h-8 text-slate-500 mx-auto" />
@@ -1024,10 +950,8 @@ export default function ExamAnalyticsPage() {
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 text-slate-300">
                   {filteredCandidates.map((cand) => {
-                    const isTop3 = cand.rank <= 3;
                     return (
                       <tr key={cand.submission.id} className="hover:bg-slate-800/40 transition">
-                        {/* Rank */}
                         <td className="py-3.5 px-4">
                           <span
                             className={`inline-flex items-center justify-center w-7 h-7 rounded-xl font-black text-xs ${
@@ -1044,13 +968,11 @@ export default function ExamAnalyticsPage() {
                           </span>
                         </td>
 
-                        {/* Candidate */}
                         <td className="py-3.5 px-4">
                           <div className="font-bold text-white leading-tight">{cand.userName}</div>
                           <div className="text-[11px] text-slate-500 font-mono">{cand.userEmail}</div>
                         </td>
 
-                        {/* Total Score */}
                         <td className="py-3.5 px-4 text-center">
                           <span className="font-extrabold text-base text-purple-400">
                             {cand.totalScore}
@@ -1058,7 +980,6 @@ export default function ExamAnalyticsPage() {
                           <span className="text-[10px] text-slate-500 block">/ {exam.total_marks}</span>
                         </td>
 
-                        {/* Physics */}
                         <td className="py-3.5 px-4 text-center">
                           <div className="font-bold text-cyan-400">
                             {cand.subjectBreakdown.physics.score}
@@ -1068,7 +989,6 @@ export default function ExamAnalyticsPage() {
                           </div>
                         </td>
 
-                        {/* Chemistry */}
                         <td className="py-3.5 px-4 text-center">
                           <div className="font-bold text-emerald-400">
                             {cand.subjectBreakdown.chemistry.score}
@@ -1078,7 +998,6 @@ export default function ExamAnalyticsPage() {
                           </div>
                         </td>
 
-                        {/* Math */}
                         <td className="py-3.5 px-4 text-center">
                           <div className="font-bold text-indigo-400">
                             {cand.subjectBreakdown.mathematics.score}
@@ -1088,7 +1007,6 @@ export default function ExamAnalyticsPage() {
                           </div>
                         </td>
 
-                        {/* Accuracy */}
                         <td className="py-3.5 px-4 text-center font-bold text-white">
                           <span
                             className={
@@ -1103,19 +1021,16 @@ export default function ExamAnalyticsPage() {
                           </span>
                         </td>
 
-                        {/* Pattern */}
                         <td className="py-3.5 px-4 text-center">
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-800 text-[11px] font-mono text-slate-300">
                             {cand.attemptPattern || "Standard"}
                           </span>
                         </td>
 
-                        {/* Total Time */}
                         <td className="py-3.5 px-4 text-center text-slate-400 font-mono">
                           {formatDuration(cand.totalTimeSec)}
                         </td>
 
-                        {/* Actions */}
                         <td className="py-3.5 px-4 text-right">
                           <button
                             type="button"
@@ -1136,12 +1051,8 @@ export default function ExamAnalyticsPage() {
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* TAB 3: QUESTION-LEVEL TIME & ACCURACY ANALYSIS */}
-      {/* ========================================================================= */}
       {activeTab === "questions" && (
         <div className="space-y-5">
-          {/* Filter Bar */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <span className="text-xs text-slate-400">Filter Section:</span>
@@ -1175,7 +1086,6 @@ export default function ExamAnalyticsPage() {
             </div>
           </div>
 
-          {/* Question Analytics Table */}
           <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-900 shadow-xl">
             <table className="w-full text-left text-xs border-collapse">
               <thead className="bg-slate-950/80 border-b border-slate-800 text-slate-400 font-semibold uppercase tracking-wider">
@@ -1202,31 +1112,26 @@ export default function ExamAnalyticsPage() {
                     const conf = SUBJECT_CONFIG[item.question.subject];
                     return (
                       <tr key={item.question.id} className="hover:bg-slate-800/30 transition">
-                        {/* Q# */}
                         <td className="py-3.5 px-4 font-mono font-bold text-white">
                           Q{item.qNumber}
                         </td>
 
-                        {/* Subject */}
                         <td className="py-3.5 px-4">
                           <span className={`px-2 py-0.5 rounded-full text-[11px] font-bold border ${conf.badge}`}>
                             {conf.label}
                           </span>
                         </td>
 
-                        {/* Statement Snippet */}
                         <td className="py-3.5 px-4">
                           <div className="line-clamp-2 text-slate-200 text-xs">
                             <MathView math={item.question.question_text} />
                           </div>
                         </td>
 
-                        {/* Key */}
                         <td className="py-3.5 px-4 text-center font-bold font-mono text-emerald-400">
                           {item.question.correct_answer}
                         </td>
 
-                        {/* Cohort Accuracy */}
                         <td className="py-3.5 px-4 text-center">
                           <span
                             className={`font-black text-sm ${
@@ -1244,22 +1149,18 @@ export default function ExamAnalyticsPage() {
                           </span>
                         </td>
 
-                        {/* Attempt Rate */}
                         <td className="py-3.5 px-4 text-center font-mono text-slate-300">
                           {item.attemptRate}%
                         </td>
 
-                        {/* Avg Time Spent */}
                         <td className="py-3.5 px-4 text-center font-mono font-bold text-cyan-400">
                           {formatDuration(item.avgTimeSec)}
                         </td>
 
-                        {/* Neg Mark Rate */}
                         <td className="py-3.5 px-4 text-center font-mono text-red-400">
                           {item.negativeRate}%
                         </td>
 
-                        {/* Difficulty */}
                         <td className="py-3.5 px-4 text-center">
                           <span
                             className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
@@ -1282,13 +1183,9 @@ export default function ExamAnalyticsPage() {
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* CANDIDATE FULL ANALYSIS MODAL / DRAWER */}
-      {/* ========================================================================= */}
       {selectedCandidate && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/85 backdrop-blur-md animate-in fade-in duration-150">
           <div className="w-full max-w-5xl max-h-[92vh] flex flex-col bg-slate-900 border border-slate-700/80 rounded-2xl shadow-2xl overflow-hidden">
-            {/* Header */}
             <div className="px-6 py-4 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between gap-4">
               <div>
                 <div className="flex items-center gap-2">
@@ -1311,9 +1208,7 @@ export default function ExamAnalyticsPage() {
               </button>
             </div>
 
-            {/* Scrollable Modal Content */}
             <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              {/* Subject Breakdown Cards */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 {(["physics", "chemistry", "mathematics"] as const).map((s) => {
                   const conf = SUBJECT_CONFIG[s];
@@ -1359,7 +1254,6 @@ export default function ExamAnalyticsPage() {
                 })}
               </div>
 
-              {/* Attempting Pattern & Behavioral Telemetry Summary */}
               <div className="p-5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-3">
                 <div className="text-xs font-bold uppercase tracking-wider text-purple-400 flex items-center gap-1.5">
                   <Flame className="w-4 h-4" />
@@ -1367,7 +1261,6 @@ export default function ExamAnalyticsPage() {
                 </div>
 
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs">
-                  {/* Pattern */}
                   <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
                     <span className="text-[10px] text-slate-400 block">Subject Flow</span>
                     <span className="font-mono font-bold text-white text-xs mt-0.5 block">
@@ -1375,7 +1268,6 @@ export default function ExamAnalyticsPage() {
                     </span>
                   </div>
 
-                  {/* Revisits */}
                   <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
                     <span className="text-[10px] text-slate-400 block">Question Revisits</span>
                     <span className="font-mono font-bold text-cyan-400 text-sm mt-0.5 block">
@@ -1383,7 +1275,6 @@ export default function ExamAnalyticsPage() {
                     </span>
                   </div>
 
-                  {/* Answer Switches */}
                   <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
                     <span className="text-[10px] text-slate-400 block">Answer Switches</span>
                     <span className="font-mono font-bold text-amber-400 text-sm mt-0.5 block">
@@ -1391,7 +1282,6 @@ export default function ExamAnalyticsPage() {
                     </span>
                   </div>
 
-                  {/* Rushed Wrong */}
                   <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
                     <span className="text-[10px] text-slate-400 block">Rushed Mistakes (&lt;15s)</span>
                     <span className="font-mono font-bold text-red-400 text-sm mt-0.5 block">
@@ -1399,7 +1289,6 @@ export default function ExamAnalyticsPage() {
                     </span>
                   </div>
 
-                  {/* Overtime Traps */}
                   <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 col-span-2 sm:col-span-1">
                     <span className="text-[10px] text-slate-400 block">Time Sinks (&gt;3m)</span>
                     <span className="font-mono font-bold text-purple-400 text-sm mt-0.5 block">
@@ -1409,7 +1298,6 @@ export default function ExamAnalyticsPage() {
                 </div>
               </div>
 
-              {/* Complete Question-by-Question Telemetry Table */}
               <div className="space-y-2">
                 <div className="text-xs font-bold text-white uppercase tracking-wider">
                   Question-by-Question Response &amp; Time Log (Q1–Q{questions.length})
