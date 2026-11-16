@@ -151,46 +151,66 @@ export default function ExamAnalyticsPage() {
         const { data: qData, error: qError } = await supabase
           .from("questions")
           .select("*")
-          .eq("exam_id", examId)
+          .or(`exam_id.eq.${examId},test_id.eq.${examId}`)
           .order("order_index", { ascending: true });
 
         if (qError) throw new Error(qError.message);
-        setQuestions(qData || []);
+        const fetchedQuestions = qData || [];
+        setQuestions(fetchedQuestions);
 
-        // Robust submissions fetch supporting both exam_id and test_id
+        // Robust multi-source submissions fetch
         let fetchedSubmissions: Submission[] = [];
+        
+        // 1. Fetch from submissions table with flexible OR matching
         const { data: subData } = await supabase
           .from("submissions")
           .select("*")
-          .or(`exam_id.eq.${examId},test_id.eq.${examId}`)
-          .order("submitted_at", { ascending: false });
+          .or(`exam_id.eq.${examId},test_id.eq.${examId}`);
 
         if (subData && subData.length > 0) {
           fetchedSubmissions = subData;
-        } else {
-          // Fallback check test_sessions if submissions table query is empty
-          const { data: sessData } = await supabase
-            .from("test_sessions")
-            .select("*")
-            .eq("exam_id", examId);
+        }
 
-          if (sessData && sessData.length > 0) {
-            fetchedSubmissions = sessData.map((s: any) => ({
-              id: s.id || `${s.user_id}_${s.exam_id}`,
-              user_id: s.user_id,
-              exam_id: s.exam_id,
-              answers: s.answers || {},
-              status: s.status || "completed",
-              created_at: s.updated_at || new Date().toISOString(),
-              submitted_at: s.updated_at || new Date().toISOString(),
-              total_score: 0,
-            }));
-          }
+        // 2. Fetch from test_sessions table as well to merge any submitted sessions
+        const { data: sessData } = await supabase
+          .from("test_sessions")
+          .select("*")
+          .or(`exam_id.eq.${examId},test_id.eq.${examId}`);
+
+        if (sessData && sessData.length > 0) {
+          sessData.forEach((s: any) => {
+            const existingIdx = fetchedSubmissions.findIndex(
+              (sub) => sub.user_id === s.user_id || (sub as any).student_id === s.user_id
+            );
+            if (existingIdx >= 0) {
+              if (!fetchedSubmissions[existingIdx].answers || Object.keys(fetchedSubmissions[existingIdx].answers || {}).length === 0) {
+                fetchedSubmissions[existingIdx].answers = s.answers || {};
+              }
+            } else {
+              fetchedSubmissions.push({
+                id: s.id || `${s.user_id}_${s.exam_id}`,
+                user_id: s.user_id,
+                exam_id: s.exam_id,
+                answers: s.answers || {},
+                status: s.status || "completed",
+                created_at: s.updated_at || new Date().toISOString(),
+                submitted_at: s.updated_at || new Date().toISOString(),
+                total_score: 0,
+              });
+            }
+          });
         }
 
         setSubmissions(fetchedSubmissions);
 
-        const userIds = Array.from(new Set(fetchedSubmissions.map((s) => s.user_id || (s as any).student_id).filter(Boolean)));
+        const userIds = Array.from(
+          new Set(
+            fetchedSubmissions
+              .map((s) => s.user_id || (s as any).student_id)
+              .filter(Boolean)
+          )
+        );
+
         if (userIds.length > 0) {
           const { data: profData } = await supabase
             .from("profiles")
@@ -263,6 +283,8 @@ export default function ExamAnalyticsPage() {
       let revisitCount = 0;
       let switchCount = 0;
 
+      const studentAnswers = sub.answers || {};
+
       subjects.forEach((subj) => {
         const subjQs = questions.filter((q) => q.subject === subj);
         let sScore = 0;
@@ -284,17 +306,18 @@ export default function ExamAnalyticsPage() {
             if (timeOnQ > 180) overtimeTrapCount++;
           }
 
-          const ans = sub.answers?.[q.id];
+          // Flexible answer matching (supports q.id key or index-based key)
+          const ans = studentAnswers[q.id] || studentAnswers[q.order_index ?? -1];
           const isAttempted =
             ans &&
-            (ans.status === "answered" || ans.status === "answered_and_marked_for_review") &&
+            (ans.status === "answered" || ans.status === "answered_and_marked_for_review" || ans.selected_answer) &&
             Boolean(ans.selected_answer);
 
           if (isAttempted && ans.selected_answer) {
             const isCorrect =
               q.type === "mcq"
-                ? ans.selected_answer.trim().toUpperCase() === q.correct_answer.trim().toUpperCase()
-                : ans.selected_answer.trim() === q.correct_answer.trim();
+                ? String(ans.selected_answer).trim().toUpperCase() === String(q.correct_answer).trim().toUpperCase()
+                : String(ans.selected_answer).trim() === String(q.correct_answer).trim();
 
             if (isCorrect) {
               sCorrect++;
@@ -348,7 +371,7 @@ export default function ExamAnalyticsPage() {
         .join(" → ");
 
       const computedTotalScore =
-        sub.total_score !== null && sub.total_score !== undefined
+        sub.total_score !== null && sub.total_score !== undefined && Number(sub.total_score) !== 0
           ? Number(sub.total_score)
           : breakdownResult.physics.score +
             breakdownResult.chemistry.score +
@@ -468,17 +491,18 @@ export default function ExamAnalyticsPage() {
           timedCount++;
         }
 
-        const ans = sub.answers?.[q.id];
+        const studentAnsMap = sub.answers || {};
+        const ans = studentAnsMap[q.id] || studentAnsMap[q.order_index ?? -1];
         const isAttempted =
           ans &&
-          (ans.status === "answered" || ans.status === "answered_and_marked_for_review") &&
+          (ans.status === "answered" || ans.status === "answered_and_marked_for_review" || ans.selected_answer) &&
           Boolean(ans.selected_answer);
 
         if (isAttempted && ans.selected_answer) {
           const isCorrect =
             q.type === "mcq"
-              ? ans.selected_answer.trim().toUpperCase() === q.correct_answer.trim().toUpperCase()
-              : ans.selected_answer.trim() === q.correct_answer.trim();
+              ? String(ans.selected_answer).trim().toUpperCase() === String(q.correct_answer).trim().toUpperCase()
+              : String(ans.selected_answer).trim() === String(q.correct_answer).trim();
           if (isCorrect) correctCount++;
           else incorrectCount++;
         } else {
@@ -1343,22 +1367,23 @@ export default function ExamAnalyticsPage() {
                     </thead>
                     <tbody className="divide-y divide-slate-800/60 text-slate-300">
                       {questions.map((q, idx) => {
-                        const ans = selectedCandidate.submission.answers?.[q.id];
+                        const studentAnsMap = selectedCandidate.submission.answers || {};
+                        const ans = studentAnsMap[q.id] || studentAnsMap[q.order_index ?? -1];
                         const t = selectedCandidate.telemetry[q.id];
                         const timeSec = t?.time_spent_sec || 0;
                         const visits = t?.visit_count || (ans ? 1 : 0);
                         const isAttempted =
                           ans &&
-                          (ans.status === "answered" || ans.status === "answered_and_marked_for_review") &&
+                          (ans.status === "answered" || ans.status === "answered_and_marked_for_review" || ans.selected_answer) &&
                           Boolean(ans.selected_answer);
 
                         let isCorrect = false;
                         if (isAttempted && ans.selected_answer) {
                           isCorrect =
                             q.type === "mcq"
-                              ? ans.selected_answer.trim().toUpperCase() ===
-                                q.correct_answer.trim().toUpperCase()
-                              : ans.selected_answer.trim() === q.correct_answer.trim();
+                              ? String(ans.selected_answer).trim().toUpperCase() ===
+                                String(q.correct_answer).trim().toUpperCase()
+                              : String(ans.selected_answer).trim() === String(q.correct_answer).trim();
                         }
 
                         let markGained = 0;
