@@ -158,15 +158,21 @@ export default function ExamAnalyticsPage() {
         const fetchedQuestions = qData || [];
         setQuestions(fetchedQuestions);
 
-        // Fetch submissions and test_sessions in parallel
+        // Fetch submissions and test_sessions
         const [{ data: subData }, { data: sessData }] = await Promise.all([
           supabase.from("submissions").select("*").or(`exam_id.eq.${examId},test_id.eq.${examId}`),
           supabase.from("test_sessions").select("*").or(`exam_id.eq.${examId},test_id.eq.${examId}`)
         ]);
 
+        console.log("ANALYTICS DEBUG - ExamID:", examId);
+        console.log("ANALYTICS DEBUG - Questions:", fetchedQuestions.length);
+        console.log("ANALYTICS DEBUG - Submissions:", subData);
+        console.log("ANALYTICS DEBUG - Sessions:", sessData);
+
         const sessionMap = new Map();
         (sessData || []).forEach((s: any) => {
-          sessionMap.set(s.user_id || s.student_id, s.answers || {});
+          const uId = s.user_id || s.student_id;
+          if (uId) sessionMap.set(uId, s.answers || {});
         });
 
         let fetchedSubmissions: Submission[] = [];
@@ -183,7 +189,7 @@ export default function ExamAnalyticsPage() {
           });
         }
 
-        // Add any sessions that don't have a submission record yet
+        // Add sessions not present in submissions
         (sessData || []).forEach((s: any) => {
           const uId = s.user_id || s.student_id;
           const exists = fetchedSubmissions.some((sub: any) => (sub.user_id || sub.student_id) === uId);
@@ -290,6 +296,7 @@ export default function ExamAnalyticsPage() {
         if (studentAnswers[q.id]) return studentAnswers[q.id];
         if (q.order_index !== undefined && studentAnswers[q.order_index]) return studentAnswers[q.order_index];
         if (studentAnswers[idx]) return studentAnswers[idx];
+        // Search by matching question_id property inside values
         const found = Object.values(studentAnswers).find((a: any) => a && (a.question_id === q.id || a.id === q.id));
         if (found) return found;
         return null;
