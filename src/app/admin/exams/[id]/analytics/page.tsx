@@ -158,10 +158,8 @@ export default function ExamAnalyticsPage() {
         const fetchedQuestions = qData || [];
         setQuestions(fetchedQuestions);
 
-        // Robust multi-source submissions fetch
         let fetchedSubmissions: Submission[] = [];
         
-        // 1. Fetch from submissions table with flexible OR matching
         const { data: subData } = await supabase
           .from("submissions")
           .select("*")
@@ -171,7 +169,6 @@ export default function ExamAnalyticsPage() {
           fetchedSubmissions = subData;
         }
 
-        // 2. Fetch from test_sessions table as well to merge any submitted sessions
         const { data: sessData } = await supabase
           .from("test_sessions")
           .select("*")
@@ -285,6 +282,16 @@ export default function ExamAnalyticsPage() {
 
       const studentAnswers = sub.answers || {};
 
+      const getStudentAns = (q: Question, idx: number) => {
+        if (!studentAnswers) return null;
+        if (studentAnswers[q.id]) return studentAnswers[q.id];
+        if (q.order_index !== undefined && studentAnswers[q.order_index]) return studentAnswers[q.order_index];
+        if (studentAnswers[idx]) return studentAnswers[idx];
+        const found = Object.values(studentAnswers).find((a: any) => a && (a.question_id === q.id || a.id === q.id));
+        if (found) return found;
+        return null;
+      };
+
       subjects.forEach((subj) => {
         const subjQs = questions.filter((q) => q.subject === subj);
         let sScore = 0;
@@ -294,7 +301,7 @@ export default function ExamAnalyticsPage() {
         let sTime = 0;
         let sMax = 0;
 
-        subjQs.forEach((q) => {
+        subjQs.forEach((q, qIdx) => {
           sMax += q.positive_marks ?? 4;
           const t = telemetry[q.id];
           const timeOnQ = t?.time_spent_sec || 0;
@@ -306,18 +313,17 @@ export default function ExamAnalyticsPage() {
             if (timeOnQ > 180) overtimeTrapCount++;
           }
 
-          // Flexible answer matching (supports q.id key or index-based key)
-          const ans = studentAnswers[q.id] || studentAnswers[q.order_index ?? -1];
-          const isAttempted =
-            ans &&
-            (ans.status === "answered" || ans.status === "answered_and_marked_for_review" || ans.selected_answer) &&
-            Boolean(ans.selected_answer);
+          const ansObj = getStudentAns(q, qIdx);
+          const selectedAns = typeof ansObj === "string" ? ansObj : ansObj?.selected_answer;
+          const isAttempted = Boolean(selectedAns !== null && selectedAns !== undefined && String(selectedAns).trim() !== "");
 
-          if (isAttempted && ans.selected_answer) {
+          if (isAttempted && selectedAns !== null && selectedAns !== undefined) {
+            const given = String(selectedAns).trim().toUpperCase();
+            const correct = String(q.correct_answer).trim().toUpperCase();
             const isCorrect =
               q.type === "mcq"
-                ? String(ans.selected_answer).trim().toUpperCase() === String(q.correct_answer).trim().toUpperCase()
-                : String(ans.selected_answer).trim() === String(q.correct_answer).trim();
+                ? given === correct
+                : String(selectedAns).trim() === String(q.correct_answer).trim();
 
             if (isCorrect) {
               sCorrect++;
@@ -492,17 +498,17 @@ export default function ExamAnalyticsPage() {
         }
 
         const studentAnsMap = sub.answers || {};
-        const ans = studentAnsMap[q.id] || studentAnsMap[q.order_index ?? -1];
-        const isAttempted =
-          ans &&
-          (ans.status === "answered" || ans.status === "answered_and_marked_for_review" || ans.selected_answer) &&
-          Boolean(ans.selected_answer);
+        const ansObj = studentAnsMap[q.id] || studentAnsMap[q.order_index ?? -1] || Object.values(studentAnsMap).find((a: any) => a && a.question_id === q.id);
+        const selectedAns = typeof ansObj === "string" ? ansObj : ansObj?.selected_answer;
+        const isAttempted = Boolean(selectedAns !== null && selectedAns !== undefined && String(selectedAns).trim() !== "");
 
-        if (isAttempted && ans.selected_answer) {
+        if (isAttempted && selectedAns !== null && selectedAns !== undefined) {
+          const given = String(selectedAns).trim().toUpperCase();
+          const correct = String(q.correct_answer).trim().toUpperCase();
           const isCorrect =
             q.type === "mcq"
-              ? String(ans.selected_answer).trim().toUpperCase() === String(q.correct_answer).trim().toUpperCase()
-              : String(ans.selected_answer).trim() === String(q.correct_answer).trim();
+              ? given === correct
+              : String(selectedAns).trim() === String(q.correct_answer).trim();
           if (isCorrect) correctCount++;
           else incorrectCount++;
         } else {
@@ -1368,22 +1374,20 @@ export default function ExamAnalyticsPage() {
                     <tbody className="divide-y divide-slate-800/60 text-slate-300">
                       {questions.map((q, idx) => {
                         const studentAnsMap = selectedCandidate.submission.answers || {};
-                        const ans = studentAnsMap[q.id] || studentAnsMap[q.order_index ?? -1];
+                        const ansObj = studentAnsMap[q.id] || studentAnsMap[q.order_index ?? -1] || Object.values(studentAnsMap).find((a: any) => a && a.question_id === q.id);
+                        const selectedAns = typeof ansObj === "string" ? ansObj : ansObj?.selected_answer;
                         const t = selectedCandidate.telemetry[q.id];
                         const timeSec = t?.time_spent_sec || 0;
-                        const visits = t?.visit_count || (ans ? 1 : 0);
-                        const isAttempted =
-                          ans &&
-                          (ans.status === "answered" || ans.status === "answered_and_marked_for_review" || ans.selected_answer) &&
-                          Boolean(ans.selected_answer);
+                        const visits = t?.visit_count || (ansObj ? 1 : 0);
+                        const isAttempted = Boolean(selectedAns !== null && selectedAns !== undefined && String(selectedAns).trim() !== "");
 
                         let isCorrect = false;
-                        if (isAttempted && ans.selected_answer) {
+                        if (isAttempted && selectedAns !== null && selectedAns !== undefined) {
                           isCorrect =
                             q.type === "mcq"
-                              ? String(ans.selected_answer).trim().toUpperCase() ===
+                              ? String(selectedAns).trim().toUpperCase() ===
                                 String(q.correct_answer).trim().toUpperCase()
-                              : String(ans.selected_answer).trim() === String(q.correct_answer).trim();
+                              : String(selectedAns).trim() === String(q.correct_answer).trim();
                         }
 
                         let markGained = 0;
@@ -1412,7 +1416,7 @@ export default function ExamAnalyticsPage() {
                               </div>
                             </td>
                             <td className="py-2 px-3 text-center font-mono font-bold">
-                              {ans?.selected_answer ? (
+                              {selectedAns ? (
                                 <span
                                   className={
                                     isCorrect
@@ -1420,7 +1424,7 @@ export default function ExamAnalyticsPage() {
                                       : "text-red-400 line-through"
                                   }
                                 >
-                                  {ans.selected_answer}
+                                  {selectedAns}
                                 </span>
                               ) : (
                                 <span className="text-slate-600">-</span>
