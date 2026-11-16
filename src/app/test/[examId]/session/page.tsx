@@ -245,18 +245,14 @@ function ExamSessionContent() {
   const [userId, setUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Active section & current question index within filtered questions
   const [activeSubject, setActiveSubject] = useState<Subject>("physics");
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
 
-  // Candidate answers map: question_id -> CandidateAnswer
   const [candidateAnswers, setCandidateAnswers] = useState<Record<string, CandidateAnswer>>({});
 
-  // Timer: remaining seconds
   const [secondsRemaining, setSecondsRemaining] = useState<number>(180 * 60);
   const [timerInitialized, setTimerInitialized] = useState(false);
 
-  // Submission modal state
   const [showSubmitModal, setShowSubmitModal] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(true);
@@ -273,7 +269,6 @@ function ExamSessionContent() {
     secondsRemainingRef.current = secondsRemaining;
   }, [secondsRemaining]);
 
-  // Browser Exit Guard: prevent accidental tab close or page reload during active test
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (!isFinalizing.current && !isSubmitting) {
@@ -289,7 +284,6 @@ function ExamSessionContent() {
     };
   }, [isSubmitting]);
 
-  // Granular Question & Subject Telemetry Refs (No extra re-renders per second)
   const telemetryRef = useRef<Record<string, QuestionTelemetry>>({});
   const activeQuestionIdRef = useRef<string | null>(null);
   const activeQuestionStartRef = useRef<number>(Date.now());
@@ -340,7 +334,6 @@ function ExamSessionContent() {
     [flushActiveQuestionTime]
   );
 
-  // Auto-Save & Upsert progress to public.test_sessions and localStorage
   const persistSessionProgress = useCallback(
     async (
       answersToSave: Record<string, CandidateAnswer>,
@@ -374,7 +367,6 @@ function ExamSessionContent() {
         updated_at: new Date().toISOString(),
       };
 
-      // 1. Instant fallback in localStorage
       try {
         localStorage.setItem(
           `cbt_session_${examId}_${userId}`,
@@ -384,7 +376,6 @@ function ExamSessionContent() {
         console.warn("Could not cache test session in localStorage:", err);
       }
 
-      // 2. Upsert to public.test_sessions
       try {
         const { error: sessErr } = await supabase
           .from("test_sessions")
@@ -397,7 +388,6 @@ function ExamSessionContent() {
         console.warn("Error upserting to test_sessions:", err);
       }
 
-      // 3. Keep public.submissions updated in parallel for backward compatibility
       try {
         await supabase
           .from("submissions")
@@ -412,64 +402,61 @@ function ExamSessionContent() {
   );
 
   // Final Exam Submission & Evaluation
-        const handleFinalSubmit = useCallback(async () => {
-    if (isFinalizing.current) return;
-    isFinalizing.current = true;
-    setIsSubmitting(true);
+  const handleFinalSubmit = useCallback(
+    async (forcedAnswers?: Record<string, CandidateAnswer>) => {
+      if (isFinalizing.current) return;
+      isFinalizing.current = true;
+      setIsSubmitting(true);
+      flushActiveQuestionTime();
 
-    const { data: { user } } = await supabase.auth.getUser();
-    const currentUserId = userId || user?.id;
+      try {
+        const answersToGrade = forcedAnswers || candidateAnswersRef.current;
+        const subjects: Subject[] = ["physics", "chemistry", "mathematics"];
+        const subjectBreakdownData: Record<string, SubjectBreakdown> = {};
+        let calculatedScore = 0;
 
-    if (!currentUserId) {
-      setIsSubmitting(false);
-      isFinalizing.current = false;
-      return;
-    }
+        subjects.forEach((subj) => {
+          const subjQs = questions.filter((q) => q.subject === subj);
+          let score = 0;
+          let correct = 0;
+          let incorrect = 0;
+          let unattempted = 0;
+          let timeSpent = 0;
+          let maxMarks = 0;
 
-    let correctCount = 0;
-    let incorrectCount = 0;
-    let unattemptedCount = 0;
-    let totalScore = 0;
+          subjQs.forEach((q) => {
+            maxMarks += Number(q.positive_marks ?? 4);
+            const t = telemetryRef.current[q.id];
+            timeSpent += t?.time_spent_sec || 0;
 
-    questions.forEach((q) => {
-      const studentAns = candidateAnswers[q.id];
+            const ans = answersToGrade[q.id];
+            const isAttempted =
+              ans &&
+              (ans.status === "answered" || ans.status === "answered_and_marked_for_review") &&
+              Boolean(ans.selected_answer);
 
-      if (!studentAns || !studentAns.selected_answer) {
-        unattemptedCount++;
-      } else {
-        const given = String(studentAns.selected_answer).trim().toUpperCase();
-        const correct = String(q.correct_answer).trim().toUpperCase();
+            if (isAttempted && ans.selected_answer) {
+              const isCorrect =
+                q.type === "mcq"
+                  ? ans.selected_answer.trim().toUpperCase() === q.correct_answer.trim().toUpperCase()
+                  : ans.selected_answer.trim() === q.correct_answer.trim();
 
-        if (given === correct) {
-          correctCount++;
-          totalScore += Number(q.positive_marks || 4);
-        } else {
-          incorrectCount++;
-          totalScore -= Number(q.negative_marks || 1);
-        }
-      }
-    });
+              if (isCorrect) {
+                correct++;
+                const pos = Number(q.positive_marks ?? 4);
+                score += pos;
+                calculatedScore += pos;
+              } else {
+                incorrect++;
+                const neg = exam?.has_negative_marking ? Number(q.negative_marks ?? 1) : 0;
+                score -= neg;
+                calculatedScore -= neg;
+              }
+            } else {
+              unattempted++;
+            }
+          });
 
-    const { error } = await supabase.from('submissions').upsert({
-      student_id: currentUserId,
-      test_id: examId,
-      total_score: totalScore,
-      correct_count: correctCount,
-      incorrect_count: incorrectCount,
-      unattempted_count: unattemptedCount,
-      answers: candidateAnswers,
-      status: 'completed',
-      submitted_at: new Date().toISOString()
-    }, { onConflict: 'student_id, test_id' });
-
-    if (error) {
-      console.error("Submission error:", error.message);
-      setIsSubmitting(false);
-      isFinalizing.current = false;
-    } else {
-      router.push(`/test/${examId}/result`);
-    }
-  }, [userId, examId, questions, candidateAnswers, router]);
           const accuracy =
             correct + incorrect > 0
               ? Math.round((correct / (correct + incorrect)) * 1000) / 10
@@ -525,7 +512,6 @@ function ExamSessionContent() {
           .eq("user_id", userId)
           .eq("exam_id", examId);
 
-        // Safe fallback if telemetry columns not yet created in remote DB
         if (
           subUpdateError &&
           (subUpdateError.message.includes("question_telemetry") ||
@@ -543,7 +529,6 @@ function ExamSessionContent() {
             .eq("exam_id", examId);
         }
 
-        // LocalStorage cache for instant results view
         try {
           localStorage.setItem(
             `cbt_telemetry_${examId}_${userId}`,
@@ -572,7 +557,6 @@ function ExamSessionContent() {
     handleFinalSubmitRef.current = handleFinalSubmit;
   }, [handleFinalSubmit]);
 
-  // Load Exam, Questions, and Hydrate Session (test_sessions & submissions)
   useEffect(() => {
     let ignore = false;
     async function init() {
@@ -613,7 +597,6 @@ function ExamSessionContent() {
         if (!ignore && qData) {
           setQuestions(qData);
 
-          // 1. Check if an active or submitted test_sessions entry exists
           let sessionData: any = null;
           try {
             const { data: dbSession, error: sessErr } = await supabase
@@ -630,7 +613,6 @@ function ExamSessionContent() {
             console.warn("test_sessions query notice:", e);
           }
 
-          // Check localStorage fallback
           if (!sessionData && typeof window !== "undefined") {
             try {
               const raw = localStorage.getItem(`cbt_session_${examId}_${user.id}`);
@@ -642,7 +624,6 @@ function ExamSessionContent() {
             }
           }
 
-// 2. Check public.submissions for already completed exam
           const { data: subData } = await supabase
             .from("submissions")
             .select("*")
@@ -666,7 +647,6 @@ function ExamSessionContent() {
             subjectVisitOrderRef.current = [...subData.subject_breakdown.subject_visit_order];
           }
 
-          // Hydrate from test_sessions if in progress
           if (sessionData && sessionData.status === "in_progress") {
             const savedSecs =
               typeof sessionData.time_remaining_seconds === "number"
@@ -728,7 +708,6 @@ function ExamSessionContent() {
               candidateAnswersRef.current = subData.answers as Record<string, CandidateAnswer>;
             }
 
-            // Fresh start timer calculation
             const nowTime = new Date().getTime();
             let startTimestamp = subData.start_time ? new Date(subData.start_time).getTime() : 0;
             
@@ -747,6 +726,7 @@ function ExamSessionContent() {
             setSecondsRemaining(remaining);
             secondsRemainingRef.current = remaining;
           } 
+        }
       } catch (err) {
         console.error("Session init error:", err);
       } finally {
@@ -769,14 +749,12 @@ function ExamSessionContent() {
 
   const currentQuestion = sectionQuestions[currentQuestionIndex] ?? null;
 
-  // Track telemetry on question change
   useEffect(() => {
     if (currentQuestion) {
       activateQuestionTelemetry(currentQuestion.id);
     }
   }, [currentQuestion?.id, activateQuestionTelemetry]);
 
-  // Track subject transition sequence
   useEffect(() => {
     if (activeSubject) {
       const list = subjectVisitOrderRef.current;
@@ -786,7 +764,6 @@ function ExamSessionContent() {
     }
   }, [activeSubject]);
 
-  // Track visibility change (tab switching)
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.hidden) {
@@ -802,7 +779,6 @@ function ExamSessionContent() {
     };
   }, [flushActiveQuestionTime]);
 
-  // Mark current question as not_answered if it was not_visited
   const selectQuestion = useCallback(
     (index: number) => {
       if (index >= 0 && index < sectionQuestions.length) {
@@ -831,7 +807,6 @@ function ExamSessionContent() {
     [sectionQuestions, persistSessionProgress]
   );
 
-  // Countdown Timer with 15-second periodic auto-save
   useEffect(() => {
     if (!timerInitialized) return;
 
@@ -851,7 +826,6 @@ function ExamSessionContent() {
         const nextSecs = prev - 1;
         secondsRemainingRef.current = nextSecs;
 
-        // Auto-save progress every 15 seconds
         if (nextSecs > 0 && nextSecs % 15 === 0) {
           persistSessionProgress(candidateAnswersRef.current, nextSecs);
         }
@@ -872,7 +846,6 @@ function ExamSessionContent() {
       .padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
   };
 
-  // Action helpers called from QuestionArea
   const recordAnswerTelemetry = (
     qId: string,
     answer: string | null,
@@ -989,7 +962,6 @@ function ExamSessionContent() {
     persistSessionProgress(updated, secondsRemainingRef.current);
   };
 
-  // Palette Status Counters
   const paletteStats = useMemo(() => {
     let answered = 0;
     let notAnswered = 0;
@@ -1009,7 +981,6 @@ function ExamSessionContent() {
     return { answered, notAnswered, marked, answeredAndMarked, notVisited };
   }, [questions, candidateAnswers]);
 
-  // Section Breakdown Summary for Confirmation Modal
   const sectionSummary = useMemo(() => {
     const subjects: Subject[] = ["physics", "chemistry", "mathematics"];
     return subjects.map((subj) => {
@@ -1091,7 +1062,6 @@ function ExamSessionContent() {
 
   return (
     <div className="h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden select-none">
-      {/* Official Top Bar */}
       <header className="border-b border-slate-800 bg-slate-900 px-4 py-2.5 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center shadow">
@@ -1105,7 +1075,6 @@ function ExamSessionContent() {
           </div>
         </div>
 
-        {/* Candidate Info & Countdown Clock */}
         <div className="flex items-center gap-3 sm:gap-6">
           <div className="hidden md:flex items-center gap-2 text-xs text-slate-300">
             <Shield className="w-3.5 h-3.5 text-emerald-400" />
@@ -1133,7 +1102,6 @@ function ExamSessionContent() {
         </div>
       </header>
 
-      {/* Section Tabs Bar */}
       <div className="border-b border-slate-800 bg-slate-900/60 px-4 py-1.5 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2 overflow-x-auto">
           {(["physics", "chemistry", "mathematics"] as Subject[]).map((subj) => {
@@ -1170,7 +1138,6 @@ function ExamSessionContent() {
         </div>
       </div>
 
-      {/* Main Terminal Area */}
       <div className="flex-1 flex overflow-hidden">
         {currentQuestion ? (
           <QuestionArea
@@ -1193,11 +1160,9 @@ function ExamSessionContent() {
           </div>
         )}
 
-        {/* Right Sidebar: Question Palette */}
         {paletteOpen && (
           <aside className="w-72 sm:w-80 border-l border-slate-800 bg-slate-900/90 flex flex-col justify-between shrink-0 overflow-y-auto">
             <div className="p-4 space-y-5">
-              {/* Legend Counters */}
               <div className="space-y-2">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
                   Question Palette Status
@@ -1241,7 +1206,6 @@ function ExamSessionContent() {
                 </div>
               </div>
 
-              {/* Section Header */}
               <div className="border-t border-slate-800 pt-3">
                 <div className="text-xs font-bold text-white capitalize mb-2.5">
                   {activeSubject} Section Questions:
@@ -1269,7 +1233,6 @@ function ExamSessionContent() {
               </div>
             </div>
 
-            {/* Bottom Final Submit Button */}
             <div className="p-4 border-t border-slate-800 bg-slate-950/70">
               <button
                 type="button"
@@ -1284,7 +1247,6 @@ function ExamSessionContent() {
         )}
       </div>
 
-      {/* Submit Confirmation Modal (Prevent Accidental Submission) */}
       {showSubmitModal && (
         <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
           <div className="w-full max-w-2xl rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl p-6 sm:p-8 space-y-6">
@@ -1302,7 +1264,6 @@ function ExamSessionContent() {
               </div>
             </div>
 
-            {/* Overall Summary KPI Cards */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
               <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center">
                 <div className="text-[10px] uppercase font-bold text-slate-500">Total Qs</div>
@@ -1334,7 +1295,6 @@ function ExamSessionContent() {
               </div>
             </div>
 
-            {/* Detailed Progress Table */}
             <div className="rounded-xl border border-slate-800 overflow-hidden bg-slate-950">
               <table className="w-full text-xs text-left">
                 <thead className="bg-slate-900/90 text-slate-400 uppercase tracking-wider text-[10px] border-b border-slate-800 font-bold">
@@ -1368,7 +1328,6 @@ function ExamSessionContent() {
                       </td>
                     </tr>
                   ))}
-                  {/* Overall Total Row */}
                   <tr className="bg-slate-900/80 font-bold border-t-2 border-slate-800">
                     <td className="py-2.5 px-3.5 font-sans text-white uppercase tracking-wider">
                       Overall Total
@@ -1391,7 +1350,6 @@ function ExamSessionContent() {
               </table>
             </div>
 
-            {/* Warning Callout */}
             <div className="text-xs text-amber-300/90 bg-amber-500/10 border border-amber-500/25 p-3.5 rounded-xl flex items-start gap-2.5">
               <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
               <div className="space-y-0.5 leading-relaxed">
@@ -1404,7 +1362,6 @@ function ExamSessionContent() {
               </div>
             </div>
 
-            {/* Modal Actions */}
             <div className="flex flex-col sm:flex-row items-center justify-end gap-3 pt-2">
               <button
                 type="button"
