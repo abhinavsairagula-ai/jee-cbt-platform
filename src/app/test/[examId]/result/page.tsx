@@ -86,18 +86,58 @@ function ExamResultContent() {
 
         if (!ignore && qData) setQuestions(qData);
 
-       // Fetch Submission
-        const { data: subData, error: subError } = await supabase
+        // BULLETPROOF TRIPLE-REDUNDANCY SUBMISSION FETCH
+        let subData: any = null;
+
+        // 1. Try Supabase submissions table (supports both student_id/user_id and test_id/exam_id)
+        const { data: sData } = await supabase
           .from("submissions")
           .select("*")
-          .eq('student_id', user.id)
-          .eq('test_id', examId)
+          .or(`student_id.eq.${user.id},user_id.eq.${user.id}`)
+          .or(`test_id.eq.${examId},exam_id.eq.${examId}`)
           .order("submitted_at", { ascending: false })
           .limit(1)
           .maybeSingle();
 
-        if (subError) {
-          console.error("Supabase submission fetch error:", subError.message);
+        if (sData) {
+          subData = sData;
+        }
+
+        // 2. Try Supabase test_sessions table if submissions is empty
+        if (!subData || !subData.answers) {
+          const { data: sessData } = await supabase
+            .from("test_sessions")
+            .select("*")
+            .eq('user_id', user.id)
+            .eq('exam_id', examId)
+            .maybeSingle();
+            
+          if (sessData) {
+            subData = {
+              ...(subData || {}),
+              answers: sessData.answers,
+              status: 'completed'
+            };
+          }
+        }
+
+        // 3. Ultimate Fallback: Browser localStorage cache
+        if ((!subData || !subData.answers || Object.keys(subData.answers).length === 0) && typeof window !== "undefined") {
+          try {
+            const cached = localStorage.getItem(`cbt_result_${examId}_${user.id}`);
+            if (cached) {
+              subData = JSON.parse(cached);
+            } else {
+              const sessCached = localStorage.getItem(`cbt_session_${examId}_${user.id}`);
+              if (sessCached) {
+                const parsed = JSON.parse(sessCached);
+                subData = {
+                  answers: parsed.answers,
+                  status: 'completed'
+                };
+              }
+            }
+          } catch (e) {}
         }
 
         if (!ignore && subData) {
