@@ -16,7 +16,6 @@ import MathView from "@/components/MathView";
 import {
   GraduationCap,
   Clock,
-  CheckCircle2,
   AlertTriangle,
   ChevronLeft,
   ChevronRight,
@@ -32,6 +31,7 @@ interface QuestionAreaProps {
   question: Question;
   questionNumber: number;
   initialAnswer: string | null;
+  onAnswerChange: (ans: string | null) => void;
   onSaveAndNext: (ans: string | null) => void;
   onSaveAndMarkForReview: (ans: string | null) => void;
   onMarkForReviewAndNext: () => void;
@@ -46,6 +46,7 @@ function QuestionArea({
   question,
   questionNumber,
   initialAnswer,
+  onAnswerChange,
   onSaveAndNext,
   onSaveAndMarkForReview,
   onMarkForReviewAndNext,
@@ -61,6 +62,21 @@ function QuestionArea({
   const [numericalInput, setNumericalInput] = useState<string>(
     question.type === "numerical" && initialAnswer ? initialAnswer : ""
   );
+
+  useEffect(() => {
+    setSelectedOption(question.type === "mcq" ? initialAnswer : null);
+    setNumericalInput(question.type === "numerical" && initialAnswer ? initialAnswer : "");
+  }, [question.id, initialAnswer, question.type]);
+
+  const handleOptionSelect = (optKey: string) => {
+    setSelectedOption(optKey);
+    onAnswerChange(optKey);
+  };
+
+  const handleNumericalChange = (val: string) => {
+    setNumericalInput(val);
+    onAnswerChange(val.trim() || null);
+  };
 
   const getCurrentAnswer = () => {
     if (question.type === "mcq") return selectedOption;
@@ -113,7 +129,7 @@ function QuestionArea({
               return (
                 <label
                   key={optKey}
-                  onClick={() => setSelectedOption(optKey)}
+                  onClick={() => handleOptionSelect(optKey)}
                   className={`p-3.5 sm:p-4 rounded-xl border text-sm flex items-start gap-3.5 transition cursor-pointer ${
                     isChecked
                       ? "bg-blue-600/15 border-blue-500 text-white ring-1 ring-blue-500"
@@ -125,7 +141,7 @@ function QuestionArea({
                     name={`q_${question.id}`}
                     value={optKey}
                     checked={isChecked}
-                    onChange={() => setSelectedOption(optKey)}
+                    onChange={() => handleOptionSelect(optKey)}
                     className="mt-1 w-4 h-4 text-blue-600 bg-slate-950 border-slate-700 focus:ring-blue-500 shrink-0"
                   />
                   <div className="flex-1">
@@ -147,13 +163,13 @@ function QuestionArea({
               <input
                 type="text"
                 value={numericalInput}
-                onChange={(e) => setNumericalInput(e.target.value)}
+                onChange={(e) => handleNumericalChange(e.target.value)}
                 placeholder="e.g. 24 or 3.14"
                 className="flex-1 px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-white font-mono text-base focus:outline-none focus:border-blue-500 transition"
               />
               <button
                 type="button"
-                onClick={() => setNumericalInput("")}
+                onClick={handleClear}
                 className="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300 transition"
               >
                 Clear
@@ -264,26 +280,10 @@ function ExamSessionContent() {
     secondsRemainingRef.current = secondsRemaining;
   }, [secondsRemaining]);
 
-  useEffect(() => {
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (!isFinalizing.current && !isSubmitting) {
-        e.preventDefault();
-        e.returnValue = "";
-        return "";
-      }
-    };
-
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    return () => {
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-    };
-  }, [isSubmitting]);
-
   const telemetryRef = useRef<Record<string, QuestionTelemetry>>({});
   const activeQuestionIdRef = useRef<string | null>(null);
   const activeQuestionStartRef = useRef<number>(Date.now());
   const visitOrderCounterRef = useRef<number>(1);
-  const subjectVisitOrderRef = useRef<string[]>([]);
 
   const flushActiveQuestionTime = useCallback(() => {
     const qId = activeQuestionIdRef.current;
@@ -310,7 +310,6 @@ function ExamSessionContent() {
   const activateQuestionTelemetry = useCallback(
     (qId: string) => {
       flushActiveQuestionTime();
-
       if (!telemetryRef.current[qId]) {
         telemetryRef.current[qId] = {
           question_id: qId,
@@ -321,7 +320,6 @@ function ExamSessionContent() {
           marked_for_review: false,
         };
       }
-
       telemetryRef.current[qId].visit_count = (telemetryRef.current[qId].visit_count || 0) + 1;
       activeQuestionIdRef.current = qId;
       activeQuestionStartRef.current = Date.now();
@@ -330,55 +328,43 @@ function ExamSessionContent() {
   );
 
   const persistSessionProgress = useCallback(
-    async (
-      answersToSave: Record<string, CandidateAnswer>,
-      remainingSecs: number
-    ) => {
+    async (answersToSave: Record<string, CandidateAnswer>, remainingSecs: number) => {
       if (!userId || !examId || isFinalizing.current) return;
-
-      const markedList: string[] = [];
-      const visitedList: string[] = [];
-
-      Object.values(answersToSave).forEach((ans) => {
-        if (ans.status !== "not_visited") {
-          visitedList.push(ans.question_id);
-        }
-        if (
-          ans.status === "marked_for_review" ||
-          ans.status === "answered_and_marked_for_review"
-        ) {
-          markedList.push(ans.question_id);
-        }
-      });
-
       const sessionPayload = {
         user_id: userId,
         exam_id: examId,
         status: "in_progress" as const,
         answers: answersToSave,
-        marked_for_review: markedList,
-        visited: visitedList,
         time_remaining_seconds: Math.max(0, remainingSecs),
         updated_at: new Date().toISOString(),
       };
-
       try {
-        localStorage.setItem(
-          `cbt_session_${examId}_${userId}`,
-          JSON.stringify(sessionPayload)
-        );
-      } catch (err) {}
-
-      try {
-        await supabase
-          .from("test_sessions")
-          .upsert(sessionPayload, { onConflict: "user_id,exam_id" });
+        await supabase.from("test_sessions").upsert(sessionPayload, { onConflict: "user_id,exam_id" });
       } catch (err) {}
     },
     [userId, examId, supabase]
   );
 
-  // Bulletproof Final Exam Submission with Column Fallbacks
+  // Instantly update answer in state when student selects an option
+  const handleAnswerChange = (answer: string | null) => {
+    if (!currentQuestion) return;
+    const currentStatus = candidateAnswers[currentQuestion.id]?.status || "not_answered";
+    const newStatus: CandidateQuestionStatus = answer ? (currentStatus === "marked_for_review" ? "answered_and_marked_for_review" : "answered") : "not_answered";
+
+    const updated = {
+      ...candidateAnswers,
+      [currentQuestion.id]: {
+        question_id: currentQuestion.id,
+        selected_answer: answer,
+        status: newStatus,
+      },
+    };
+    setCandidateAnswers(updated);
+    candidateAnswersRef.current = updated;
+    persistSessionProgress(updated, secondsRemainingRef.current);
+  };
+
+  // Bulletproof Submission Handler
   const handleFinalSubmit = useCallback(
     async (forcedAnswers?: Record<string, CandidateAnswer>) => {
       if (isFinalizing.current) return;
@@ -404,37 +390,35 @@ function ExamSessionContent() {
           let timeSpent = 0;
           let maxMarks = 0;
 
-          subjQs.forEach((q, qIdx) => {
-            const qPosMarks = Number(q.positive_marks ?? (q as any).marks ?? 4);
-            const qNegMarks = Number(q.negative_marks ?? (q as any).negative ?? 1);
-            const qCorrectAns = String(q.correct_answer ?? (q as any).answer ?? (q as any).correct_option ?? "").trim().toUpperCase();
+          subjQs.forEach((q) => {
+            const qPos = Number(q.positive_marks ?? (q as any).marks ?? 4);
+            const qNeg = Number(q.negative_marks ?? (q as any).negative ?? 1);
+            const qCorrect = String(q.correct_answer ?? (q as any).answer ?? (q as any).correct_option ?? "").trim().toUpperCase();
 
-            maxMarks += qPosMarks;
+            maxMarks += qPos;
             const t = telemetryRef.current[q.id];
             timeSpent += t?.time_spent_sec || 0;
 
-            const ansObj = answersToGrade[q.id] || answersToGrade[q.order_index ?? -1] || Object.values(answersToGrade).find((a: any) => a && a.question_id === q.id);
+            const ansObj = answersToGrade[q.id] || Object.values(answersToGrade).find((a: any) => a && a.question_id === q.id);
             const selectedAns = typeof ansObj === "string" ? ansObj : ansObj?.selected_answer;
             const isAttempted = Boolean(selectedAns !== null && selectedAns !== undefined && String(selectedAns).trim() !== "");
 
-            if (isAttempted && selectedAns !== null && selectedAns !== undefined) {
+            if (isAttempted) {
               const given = String(selectedAns).trim().toUpperCase();
-              const isCorrect =
-                q.type === "mcq"
-                  ? given === qCorrectAns
-                  : String(selectedAns).trim() === qCorrectAns;
+              const isCorrect = q.type === "mcq" ? given === qCorrect : String(selectedAns).trim() === qCorrect;
 
               if (isCorrect) {
                 correct++;
                 totalCorrectCount++;
-                score += qPosMarks;
-                calculatedScore += qPosMarks;
+                score += qPos;
+                calculatedScore += qPos;
               } else {
                 incorrect++;
                 totalIncorrectCount++;
-                const neg = exam?.has_negative_marking ? qNegMarks : 0;
-                score -= neg;
-                calculatedScore -= neg;
+                if (exam?.has_negative_marking) {
+                  score -= qNeg;
+                  calculatedScore -= qNeg;
+                }
               }
             } else {
               unattempted++;
@@ -442,11 +426,7 @@ function ExamSessionContent() {
             }
           });
 
-          const accuracy =
-            correct + incorrect > 0
-              ? Math.round((correct / (correct + incorrect)) * 1000) / 10
-              : 0;
-
+          const accuracy = correct + incorrect > 0 ? Math.round((correct / (correct + incorrect)) * 1000) / 10 : 0;
           subjectBreakdownData[subj] = {
             subject: subj,
             score,
@@ -472,13 +452,9 @@ function ExamSessionContent() {
             },
             { onConflict: "user_id,exam_id" }
           );
-        } catch (err) {}
+        } catch (e) {}
 
-        try {
-          localStorage.removeItem(`cbt_session_${examId}_${userId}`);
-        } catch (_) {}
-
-        // 2. Insert into submissions for Admin Leaderboard
+        // 2. Insert into submissions for Admin Dashboard
         try {
           await supabase.from("submissions").delete().match({ user_id: userId, exam_id: examId });
         } catch (e) {}
@@ -500,8 +476,9 @@ function ExamSessionContent() {
           subject_breakdown: subjectBreakdownData,
         };
 
-        const { error: insertErr } = await supabase.from("submissions").insert(submissionPayload);
-        if (insertErr) {
+        const { error: insErr } = await supabase.from("submissions").insert(submissionPayload);
+        if (insErr) {
+          console.error("Submission insert error:", insErr.message);
           const { question_telemetry, subject_breakdown, ...fallback } = submissionPayload;
           await supabase.from("submissions").insert(fallback);
         }
@@ -518,95 +495,39 @@ function ExamSessionContent() {
   );
 
   const handleFinalSubmitRef = useRef(handleFinalSubmit);
-  useEffect(() => {
-    handleFinalSubmitRef.current = handleFinalSubmit;
-  }, [handleFinalSubmit]);
+  useEffect(() => { handleFinalSubmitRef.current = handleFinalSubmit; }, [handleFinalSubmit]);
 
   useEffect(() => {
     let ignore = false;
     async function init() {
       if (!examId) return;
       try {
-        const {
-          data: { user },
-        } = await supabase.auth.getUser();
-
+        const { data: { user } } = await supabase.auth.getUser();
         if (!user) {
           router.push(`/login?redirectTo=/test/${examId}/session`);
           return;
         }
-
         if (!ignore) {
           setUserId(user.id);
           setUserEmail(user.email ?? "Candidate");
         }
 
-        const { data: examData } = await supabase
-          .from("exams")
-          .select("*")
-          .eq("id", examId)
-          .single();
-
+        const { data: examData } = await supabase.from("exams").select("*").eq("id", examId).single();
         if (!ignore && examData) {
           setExam(examData);
           setSecondsRemaining(examData.duration_minutes * 60);
           secondsRemainingRef.current = examData.duration_minutes * 60;
         }
 
-        const { data: qData } = await supabase
-          .from("questions")
-          .select("*")
-          .or(`exam_id.eq.${examId},test_id.eq.${examId}`)
-          .order("created_at", { ascending: true });
+        const { data: qData } = await supabase.from("questions").select("*").or(`exam_id.eq.${examId},test_id.eq.${examId}`).order("created_at", { ascending: true });
+        if (!ignore && qData) setQuestions(qData);
 
-        if (!ignore && qData) {
-          setQuestions(qData);
-
-          let sessionData: any = null;
-          try {
-            const { data: dbSession } = await supabase
-              .from("test_sessions")
-              .select("*")
-              .eq("user_id", user.id)
-              .eq("exam_id", examId)
-              .maybeSingle();
-
-            if (dbSession) sessionData = dbSession;
-          } catch (e) {}
-
-          if (!sessionData && typeof window !== "undefined") {
-            try {
-              const raw = localStorage.getItem(`cbt_session_${examId}_${user.id}`);
-              if (raw) sessionData = JSON.parse(raw);
-            } catch (e) {}
-          }
-
-          const { data: subData } = await supabase
-            .from("submissions")
-            .select("*")
-            .eq("user_id", user.id)
-            .eq("exam_id", examId)
-            .maybeSingle();
-
-          if (sessionData?.status === "submitted" || subData?.status === "completed") {
-            router.push(`/test/${examId}/result`);
-            return;
-          }
-
-          if (sessionData && sessionData.status === "in_progress") {
-            const savedSecs = sessionData.time_remaining_seconds ?? (examData ? examData.duration_minutes * 60 : 10800);
-            if (savedSecs <= 0) {
-              await handleFinalSubmitRef.current(sessionData.answers || {});
-              return;
-            }
-            setSecondsRemaining(savedSecs);
-            secondsRemainingRef.current = savedSecs;
-            setCandidateAnswers(sessionData.answers || {});
-            candidateAnswersRef.current = sessionData.answers || {};
-          }
+        const { data: subData } = await supabase.from("submissions").select("*").eq("user_id", user.id).eq("exam_id", examId).maybeSingle();
+        if (subData?.status === "completed") {
+          router.push(`/test/${examId}/result`);
         }
       } catch (err) {
-        console.error("Session init error:", err);
+        console.error("Init error:", err);
       } finally {
         if (!ignore) {
           setLoading(false);
@@ -614,56 +535,22 @@ function ExamSessionContent() {
         }
       }
     }
-
     init();
-    return () => {
-      ignore = true;
-    };
+    return () => { ignore = true; };
   }, [examId, router, supabase]);
 
-  const sectionQuestions = useMemo(() => {
-    return questions.filter((q) => q.subject === activeSubject);
-  }, [questions, activeSubject]);
-
+  const sectionQuestions = useMemo(() => questions.filter((q) => q.subject === activeSubject), [questions, activeSubject]);
   const currentQuestion = sectionQuestions[currentQuestionIndex] ?? null;
 
   useEffect(() => {
     if (currentQuestion) activateQuestionTelemetry(currentQuestion.id);
   }, [currentQuestion?.id, activateQuestionTelemetry]);
 
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.hidden) flushActiveQuestionTime();
-      else activeQuestionStartRef.current = Date.now();
-    };
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      flushActiveQuestionTime();
-    };
-  }, [flushActiveQuestionTime]);
-
-  const selectQuestion = useCallback(
-    (index: number) => {
-      if (index >= 0 && index < sectionQuestions.length) {
-        const targetQ = sectionQuestions[index];
-        setCurrentQuestionIndex(index);
-        setCandidateAnswers((prev) => {
-          if (!prev[targetQ.id]) {
-            const updated = {
-              ...prev,
-              [targetQ.id]: { question_id: targetQ.id, selected_answer: null, status: "not_answered" as const },
-            };
-            candidateAnswersRef.current = updated;
-            persistSessionProgress(updated, secondsRemainingRef.current);
-            return updated;
-          }
-          return prev;
-        });
-      }
-    },
-    [sectionQuestions, persistSessionProgress]
-  );
+  const selectQuestion = useCallback((index: number) => {
+    if (index >= 0 && index < sectionQuestions.length) {
+      setCurrentQuestionIndex(index);
+    }
+  }, [sectionQuestions]);
 
   useEffect(() => {
     if (!timerInitialized) return;
@@ -680,12 +567,11 @@ function ExamSessionContent() {
         }
         const nextSecs = prev - 1;
         secondsRemainingRef.current = nextSecs;
-        if (nextSecs % 15 === 0) persistSessionProgress(candidateAnswersRef.current, nextSecs);
         return nextSecs;
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [timerInitialized, handleFinalSubmit, persistSessionProgress]);
+  }, [timerInitialized, handleFinalSubmit]);
 
   const formatTimer = (secs: number) => {
     const hours = Math.floor(secs / 3600);
@@ -694,73 +580,36 @@ function ExamSessionContent() {
     return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
   };
 
-  const recordAnswerTelemetry = (qId: string, answer: string | null, isMarked: boolean) => {
-    const prevAnswer = candidateAnswers[qId]?.selected_answer;
-    if (!telemetryRef.current[qId]) {
-      telemetryRef.current[qId] = {
-        question_id: qId,
-        time_spent_sec: 0,
-        visit_count: 1,
-        first_visited_order: visitOrderCounterRef.current++,
-        answer_switches: 0,
-        marked_for_review: false,
-      };
-    }
-    if (prevAnswer && answer && prevAnswer !== answer) {
-      telemetryRef.current[qId].answer_switches = (telemetryRef.current[qId].answer_switches || 0) + 1;
-    }
-    if (isMarked) telemetryRef.current[qId].marked_for_review = true;
-  };
-
   const handleSaveAndNext = (answer: string | null) => {
-    if (!currentQuestion) return;
-    recordAnswerTelemetry(currentQuestion.id, answer, false);
-    const updated = {
-      ...candidateAnswers,
-      [currentQuestion.id]: { question_id: currentQuestion.id, selected_answer: answer, status: answer ? "answered" as const : "not_answered" as const },
-    };
-    setCandidateAnswers(updated);
-    candidateAnswersRef.current = updated;
-    persistSessionProgress(updated, secondsRemainingRef.current);
+    handleAnswerChange(answer);
     if (currentQuestionIndex < sectionQuestions.length - 1) selectQuestion(currentQuestionIndex + 1);
   };
 
   const handleSaveAndMarkForReview = (answer: string | null) => {
     if (!currentQuestion) return;
-    recordAnswerTelemetry(currentQuestion.id, answer, true);
     const updated = {
       ...candidateAnswers,
       [currentQuestion.id]: { question_id: currentQuestion.id, selected_answer: answer, status: answer ? "answered_and_marked_for_review" as const : "marked_for_review" as const },
     };
     setCandidateAnswers(updated);
     candidateAnswersRef.current = updated;
-    persistSessionProgress(updated, secondsRemainingRef.current);
     if (currentQuestionIndex < sectionQuestions.length - 1) selectQuestion(currentQuestionIndex + 1);
   };
 
   const handleMarkForReviewAndNext = () => {
     if (!currentQuestion) return;
     const existing = candidateAnswers[currentQuestion.id]?.selected_answer ?? null;
-    recordAnswerTelemetry(currentQuestion.id, existing, true);
     const updated = {
       ...candidateAnswers,
       [currentQuestion.id]: { question_id: currentQuestion.id, selected_answer: existing, status: existing ? "answered_and_marked_for_review" as const : "marked_for_review" as const },
     };
     setCandidateAnswers(updated);
     candidateAnswersRef.current = updated;
-    persistSessionProgress(updated, secondsRemainingRef.current);
     if (currentQuestionIndex < sectionQuestions.length - 1) selectQuestion(currentQuestionIndex + 1);
   };
 
   const handleClearResponse = () => {
-    if (!currentQuestion) return;
-    const updated = {
-      ...candidateAnswers,
-      [currentQuestion.id]: { question_id: currentQuestion.id, selected_answer: null, status: "not_answered" as const },
-    };
-    setCandidateAnswers(updated);
-    candidateAnswersRef.current = updated;
-    persistSessionProgress(updated, secondsRemainingRef.current);
+    handleAnswerChange(null);
   };
 
   const paletteStats = useMemo(() => {
@@ -776,22 +625,6 @@ function ExamSessionContent() {
     return { answered, notAnswered, marked, answeredAndMarked, notVisited };
   }, [questions, candidateAnswers]);
 
-  const sectionSummary = useMemo(() => {
-    const subjects: Subject[] = ["physics", "chemistry", "mathematics"];
-    return subjects.map((subj) => {
-      const subjQs = questions.filter((q) => q.subject === subj);
-      let answered = 0, notAnswered = 0, marked = 0, notVisited = 0;
-      subjQs.forEach((q) => {
-        const state = candidateAnswers[q.id]?.status ?? "not_visited";
-        if (state === "answered" || state === "answered_and_marked_for_review") answered++;
-        if (state === "not_answered") notAnswered++;
-        if (state === "marked_for_review" || state === "answered_and_marked_for_review") marked++;
-        if (state === "not_visited") notVisited++;
-      });
-      return { subject: subj, total: subjQs.length, answered, notAnswered, marked, notVisited };
-    });
-  }, [questions, candidateAnswers]);
-
   const getPaletteBadgeClass = (qId: string) => {
     const status = candidateAnswers[qId]?.status ?? "not_visited";
     switch (status) {
@@ -804,73 +637,32 @@ function ExamSessionContent() {
   };
 
   if (loading) {
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center gap-3">
-        <div className="w-8 h-8 border-2 border-blue-500/30 border-t-blue-500 rounded-full animate-spin" />
-        <span className="text-sm text-slate-400 font-medium">Entering CBT Environment...</span>
-      </div>
-    );
+    return <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">Loading...</div>;
   }
 
   return (
     <div className="h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden select-none">
       <header className="border-b border-slate-800 bg-slate-900 px-4 py-2.5 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center shadow">
-            <GraduationCap className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <h1 className="text-sm font-bold text-white flex items-center gap-2 truncate max-w-[280px] sm:max-w-md">
-              {exam?.title}
-            </h1>
-            <div className="text-[11px] text-slate-400">JEE (Main) Computer Based Test</div>
-          </div>
+          <GraduationCap className="w-5 h-5 text-white" />
+          <h1 className="text-sm font-bold text-white">{exam?.title}</h1>
         </div>
-
-        <div className="flex items-center gap-3 sm:gap-6">
-          <div className="hidden md:flex items-center gap-2 text-xs text-slate-300">
-            <Shield className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="font-mono text-[11px] truncate max-w-[180px]">{userEmail}</span>
-          </div>
-
-          <div
-            className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl border font-mono text-sm sm:text-base font-bold transition shadow-inner ${
-              secondsRemaining < 300
-                ? "bg-red-500/20 text-red-400 border-red-500/40 animate-pulse"
-                : "bg-slate-950 text-cyan-400 border-slate-800"
-            }`}
-          >
-            <Clock className="w-4 h-4 shrink-0" />
-            <span>{formatTimer(secondsRemaining)}</span>
-          </div>
+        <div className="flex items-center gap-3 font-mono font-bold text-cyan-400">
+          <Clock className="w-4 h-4" />
+          <span>{formatTimer(secondsRemaining)}</span>
         </div>
       </header>
 
-      <div className="border-b border-slate-800 bg-slate-900/60 px-4 py-1.5 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2 overflow-x-auto">
-          {(["physics", "chemistry", "mathematics"] as Subject[]).map((subj) => {
-            const count = questions.filter((q) => q.subject === subj).length;
-            const isSelected = activeSubject === subj;
-
-            return (
-              <button
-                key={subj}
-                onClick={() => {
-                  setActiveSubject(subj);
-                  setCurrentQuestionIndex(0);
-                }}
-                className={`py-1.5 px-4 rounded-lg text-xs font-bold uppercase tracking-wider transition cursor-pointer flex items-center gap-1.5 ${
-                  isSelected
-                    ? "bg-blue-600 text-white shadow"
-                    : "bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800/80"
-                }`}
-              >
-                <span>{subj}</span>
-                <span className="text-[10px] opacity-75 font-mono">({count})</span>
-              </button>
-            );
-          })}
-        </div>
+      <div className="border-b border-slate-800 bg-slate-900/60 px-4 py-1.5 flex items-center gap-2">
+        {(["physics", "chemistry", "mathematics"] as Subject[]).map((subj) => (
+          <button
+            key={subj}
+            onClick={() => { setActiveSubject(subj); setCurrentQuestionIndex(0); }}
+            className={`py-1.5 px-4 rounded-lg text-xs font-bold uppercase ${activeSubject === subj ? "bg-blue-600 text-white" : "bg-slate-900 text-slate-400"}`}
+          >
+            {subj}
+          </button>
+        ))}
       </div>
 
       <div className="flex-1 flex overflow-hidden">
@@ -880,6 +672,7 @@ function ExamSessionContent() {
             question={currentQuestion}
             questionNumber={currentQuestionIndex + 1}
             initialAnswer={candidateAnswers[currentQuestion.id]?.selected_answer ?? null}
+            onAnswerChange={handleAnswerChange}
             onSaveAndNext={handleSaveAndNext}
             onSaveAndMarkForReview={handleSaveAndMarkForReview}
             onMarkForReviewAndNext={handleMarkForReviewAndNext}
@@ -891,85 +684,38 @@ function ExamSessionContent() {
           />
         )}
 
-        {paletteOpen && (
-          <aside className="w-72 sm:w-80 border-l border-slate-800 bg-slate-900/90 flex flex-col justify-between shrink-0 overflow-y-auto">
-            <div className="p-4 space-y-5">
-              <div className="space-y-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                  Question Palette Status
-                </h3>
-                <div className="grid grid-cols-2 gap-2 text-[11px]">
-                  <div className="flex items-center gap-2 p-2 rounded-lg bg-slate-950 border border-slate-800">
-                    <span className="w-5 h-5 rounded bg-emerald-600 text-white font-bold flex items-center justify-center text-[10px]">
-                      {paletteStats.answered}
-                    </span>
-                    <span className="text-slate-300">Answered</span>
-                  </div>
-                  <div className="flex items-center gap-2 p-2 rounded-lg bg-slate-950 border border-slate-800">
-                    <span className="w-5 h-5 rounded bg-red-600 text-white font-bold flex items-center justify-center text-[10px]">
-                      {paletteStats.notAnswered}
-                    </span>
-                    <span className="text-slate-300">Not Answered</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="border-t border-slate-800 pt-3">
-                <div className="text-xs font-bold text-white capitalize mb-2.5">
-                  {activeSubject} Section Questions:
-                </div>
-                <div className="grid grid-cols-5 gap-2 max-h-72 overflow-y-auto pr-1">
-                  {sectionQuestions.map((q, idx) => {
-                    const isSelected = currentQuestionIndex === idx;
-                    const badgeClass = getPaletteBadgeClass(q.id);
-                    return (
-                      <button
-                        key={q.id}
-                        type="button"
-                        onClick={() => selectQuestion(idx)}
-                        className={`h-9 rounded-lg font-bold text-xs flex items-center justify-center transition border cursor-pointer ${badgeClass} ${
-                          isSelected ? "ring-2 ring-white ring-offset-2 ring-offset-slate-900" : ""
-                        }`}
-                      >
-                        {idx + 1}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
+        <aside className="w-72 border-l border-slate-800 bg-slate-900/90 flex flex-col justify-between p-4">
+          <div className="space-y-4">
+            <h3 className="text-xs font-bold text-slate-400">Question Palette</h3>
+            <div className="grid grid-cols-5 gap-2">
+              {sectionQuestions.map((q, idx) => (
+                <button
+                  key={q.id}
+                  onClick={() => selectQuestion(idx)}
+                  className={`h-9 rounded-lg font-bold text-xs ${getPaletteBadgeClass(q.id)} ${currentQuestionIndex === idx ? "ring-2 ring-white" : ""}`}
+                >
+                  {idx + 1}
+                </button>
+              ))}
             </div>
-
-            <div className="p-4 border-t border-slate-800 bg-slate-950/70">
-              <button
-                type="button"
-                onClick={() => setShowSubmitModal(true)}
-                className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-xs transition shadow-lg shadow-blue-500/25 active:scale-[0.99] flex items-center justify-center gap-2 cursor-pointer"
-              >
-                <Send className="w-4 h-4" />
-                <span>Submit Exam Paper</span>
-              </button>
-            </div>
-          </aside>
-        )}
+          </div>
+          <button
+            onClick={() => setShowSubmitModal(true)}
+            className="w-full py-3 rounded-xl bg-blue-600 text-white font-bold text-xs"
+          >
+            Submit Exam Paper
+          </button>
+        </aside>
       </div>
 
       {showSubmitModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="w-full max-w-2xl rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl p-6 sm:p-8 space-y-6">
-            <h2 className="text-xl font-bold text-white tracking-tight">Confirm Submission</h2>
-            <p className="text-xs text-slate-400">Are you ready to submit your exam paper and view your scorecard?</p>
+        <div className="fixed inset-0 z-50 bg-slate-950/85 flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-slate-900 border border-slate-800 p-6 rounded-2xl space-y-4">
+            <h2 className="text-lg font-bold text-white">Confirm Submission</h2>
+            <p className="text-xs text-slate-400">Are you ready to submit your test? Your scores will be evaluated immediately.</p>
             <div className="flex justify-end gap-3">
-              <button
-                onClick={() => setShowSubmitModal(false)}
-                className="px-5 py-2.5 rounded-xl bg-slate-800 text-slate-300 text-xs font-semibold"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => handleFinalSubmit()}
-                disabled={isSubmitting}
-                className="px-6 py-2.5 rounded-xl bg-blue-600 text-white text-xs font-bold"
-              >
+              <button onClick={() => setShowSubmitModal(false)} className="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 text-xs font-semibold">Cancel</button>
+              <button onClick={() => handleFinalSubmit()} disabled={isSubmitting} className="px-5 py-2 rounded-xl bg-blue-600 text-white text-xs font-bold">
                 {isSubmitting ? "Submitting..." : "Confirm & Submit"}
               </button>
             </div>
