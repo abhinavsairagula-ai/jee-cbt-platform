@@ -157,18 +157,40 @@ export default function ExamAnalyticsPage() {
         if (qError) throw new Error(qError.message);
         setQuestions(qData || []);
 
-        const { data: subData, error: subError } = await supabase
+        // Robust submissions fetch supporting both exam_id and test_id
+        let fetchedSubmissions: Submission[] = [];
+        const { data: subData } = await supabase
           .from("submissions")
           .select("*")
-          .eq("exam_id", examId)
-          .eq("status", "completed")
-          .order("total_score", { ascending: false });
+          .or(`exam_id.eq.${examId},test_id.eq.${examId}`)
+          .order("submitted_at", { ascending: false });
 
-        if (subError) throw new Error(subError.message);
-        const fetchedSubmissions: Submission[] = subData || [];
+        if (subData && subData.length > 0) {
+          fetchedSubmissions = subData;
+        } else {
+          // Fallback check test_sessions if submissions table query is empty
+          const { data: sessData } = await supabase
+            .from("test_sessions")
+            .select("*")
+            .eq("exam_id", examId);
+
+          if (sessData && sessData.length > 0) {
+            fetchedSubmissions = sessData.map((s: any) => ({
+              id: s.id || `${s.user_id}_${s.exam_id}`,
+              user_id: s.user_id,
+              exam_id: s.exam_id,
+              answers: s.answers || {},
+              status: s.status || "completed",
+              created_at: s.updated_at || new Date().toISOString(),
+              submitted_at: s.updated_at || new Date().toISOString(),
+              total_score: 0,
+            }));
+          }
+        }
+
         setSubmissions(fetchedSubmissions);
 
-        const userIds = Array.from(new Set(fetchedSubmissions.map((s) => s.user_id)));
+        const userIds = Array.from(new Set(fetchedSubmissions.map((s) => s.user_id || (s as any).student_id).filter(Boolean)));
         if (userIds.length > 0) {
           const { data: profData } = await supabase
             .from("profiles")
@@ -200,9 +222,10 @@ export default function ExamAnalyticsPage() {
     if (!exam || questions.length === 0 || submissions.length === 0) return [];
 
     const candidates = submissions.map((sub) => {
-      const profile = profiles[sub.user_id];
+      const uId = sub.user_id || (sub as any).student_id || "unknown";
+      const profile = profiles[uId];
       const userName = profile?.full_name || profile?.email?.split("@")[0] || "Candidate";
-      const userEmail = profile?.email || `ID: ${sub.user_id.slice(0, 8)}...`;
+      const userEmail = profile?.email || `ID: ${uId.slice(0, 8)}...`;
 
       const telemetry: Record<string, QuestionTelemetry> =
         sub.question_telemetry && typeof sub.question_telemetry === "object"
