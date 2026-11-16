@@ -76,7 +76,7 @@ function ExamResultContent() {
 
         if (!ignore && examData) setExam(examData);
 
-        // Fetch Questions (Fixed from test_id to exam_id)
+        // Fetch Questions
         const { data: qData } = await supabase
           .from("questions")
           .select("*")
@@ -85,53 +85,50 @@ function ExamResultContent() {
 
         if (!ignore && qData) setQuestions(qData);
 
-        // BULLETPROOF TRIPLE-REDUNDANCY SUBMISSION FETCH
+        // BULLETPROOF SUBMISSION & SESSION FETCH
         let subData: any = null;
 
-        const { data: sData } = await supabase
-          .from("submissions")
+        // 1. Check test_sessions table first (where session answers are stored during the test)
+        const { data: sessData } = await supabase
+          .from("test_sessions")
           .select("*")
-          .or(`student_id.eq.${user.id},user_id.eq.${user.id}`)
-          .or(`test_id.eq.${examId},exam_id.eq.${examId}`)
-          .order("submitted_at", { ascending: false })
-          .limit(1)
+          .eq("user_id", user.id)
+          .eq("exam_id", examId)
           .maybeSingle();
 
-        if (sData) {
-          subData = sData;
+        if (sessData && sessData.answers) {
+          subData = {
+            answers: sessData.answers,
+            status: "completed",
+          };
         }
 
+        // 2. Check submissions table
         if (!subData || !subData.answers) {
-          const { data: sessData } = await supabase
-            .from("test_sessions")
+          const { data: sData } = await supabase
+            .from("submissions")
             .select("*")
-            .eq("user_id", user.id)
-            .eq("exam_id", examId)
+            .or(`student_id.eq.${user.id},user_id.eq.${user.id}`)
+            .or(`test_id.eq.${examId},exam_id.eq.${examId}`)
+            .order("submitted_at", { ascending: false })
+            .limit(1)
             .maybeSingle();
-            
-          if (sessData) {
-            subData = {
-              ...(subData || {}),
-              answers: sessData.answers,
-              status: "completed",
-            };
+
+          if (sData && sData.answers) {
+            subData = sData;
           }
         }
 
+        // 3. Browser localStorage fallback
         if ((!subData || !subData.answers || Object.keys(subData.answers).length === 0) && typeof window !== "undefined") {
           try {
-            const cached = localStorage.getItem(`cbt_result_${examId}_${user.id}`);
-            if (cached) {
-              subData = JSON.parse(cached);
-            } else {
-              const sessCached = localStorage.getItem(`cbt_session_${examId}_${user.id}`);
-              if (sessCached) {
-                const parsed = JSON.parse(sessCached);
-                subData = {
-                  answers: parsed.answers,
-                  status: "completed",
-                };
-              }
+            const sessCached = localStorage.getItem(`cbt_session_${examId}_${user.id}`);
+            if (sessCached) {
+              const parsed = JSON.parse(sessCached);
+              subData = {
+                answers: parsed.answers,
+                status: "completed",
+              };
             }
           } catch (e) {}
         }
