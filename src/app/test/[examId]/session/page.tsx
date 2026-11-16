@@ -401,7 +401,7 @@ function ExamSessionContent() {
     [userId, examId, supabase]
   );
 
-  // Final Exam Submission & Evaluation with Upsert
+  // Final Exam Submission & Evaluation with Bulletproof Insert
   const handleFinalSubmit = useCallback(
     async (forcedAnswers?: Record<string, CandidateAnswer>) => {
       if (isFinalizing.current) return;
@@ -414,6 +414,9 @@ function ExamSessionContent() {
         const subjects: Subject[] = ["physics", "chemistry", "mathematics"];
         const subjectBreakdownData: Record<string, SubjectBreakdown> = {};
         let calculatedScore = 0;
+        let totalCorrectCount = 0;
+        let totalIncorrectCount = 0;
+        let totalUnattemptedCount = 0;
 
         subjects.forEach((subj) => {
           const subjQs = questions.filter((q) => q.subject === subj);
@@ -443,17 +446,20 @@ function ExamSessionContent() {
 
               if (isCorrect) {
                 correct++;
+                totalCorrectCount++;
                 const pos = Number(q.positive_marks ?? 4);
                 score += pos;
                 calculatedScore += pos;
               } else {
                 incorrect++;
+                totalIncorrectCount++;
                 const neg = exam?.has_negative_marking ? Number(q.negative_marks ?? 1) : 0;
                 score -= neg;
                 calculatedScore -= neg;
               }
             } else {
               unattempted++;
+              totalUnattemptedCount++;
             }
           });
 
@@ -496,35 +502,44 @@ function ExamSessionContent() {
           localStorage.removeItem(`cbt_session_${examId}_${userId}`);
         } catch (_) {}
 
-        // 3. Update or Insert into submissions table for admin dashboard tracking
-        const updatePayload: Record<string, any> = {
+        // 3. Bulletproof Submissions Record for Admin Dashboard
+        try {
+          await supabase.from("submissions").delete().match({ user_id: userId, exam_id: examId });
+        } catch (e) {}
+        try {
+          await supabase.from("submissions").delete().match({ student_id: userId, test_id: examId });
+        } catch (e) {}
+
+        const submissionPayload = {
           user_id: userId,
           exam_id: examId,
+          student_id: userId,
+          test_id: examId,
           status: "completed",
           end_time: new Date().toISOString(),
+          submitted_at: new Date().toISOString(),
           total_score: calculatedScore,
+          correct_count: totalCorrectCount,
+          incorrect_count: totalIncorrectCount,
+          unattempted_count: totalUnattemptedCount,
           answers: answersToGrade,
           question_telemetry: telemetryRef.current,
           subject_breakdown: subjectBreakdownData,
         };
 
-        let { error: subUpdateError } = await supabase
+        const { error: insertSubErr } = await supabase
           .from("submissions")
-          .upsert(updatePayload, { onConflict: "user_id,exam_id" });
+          .insert(submissionPayload);
 
-        if (
-          subUpdateError &&
-          (subUpdateError.message.includes("question_telemetry") ||
-            subUpdateError.message.includes("subject_breakdown"))
-        ) {
-          console.warn(
-            "Columns not found in submissions table, saving without telemetry:",
-            subUpdateError.message
-          );
-          const { question_telemetry, subject_breakdown, ...fallbackPayload } = updatePayload;
-          await supabase
+        if (insertSubErr) {
+          console.warn("Submissions insert error with telemetry, trying fallback without telemetry:", insertSubErr.message);
+          const { question_telemetry, subject_breakdown, ...fallbackPayload } = submissionPayload;
+          const { error: fallbackErr } = await supabase
             .from("submissions")
-            .upsert(fallbackPayload, { onConflict: "user_id,exam_id" });
+            .insert(fallbackPayload);
+          if (fallbackErr) {
+            console.error("Critical: Failed to save submission to Supabase:", fallbackErr.message);
+          }
         }
 
         try {
