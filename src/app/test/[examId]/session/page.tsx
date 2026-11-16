@@ -401,7 +401,7 @@ function ExamSessionContent() {
     [userId, examId, supabase]
   );
 
-  // Final Exam Submission & Evaluation
+  // Final Exam Submission & Evaluation with Upsert
   const handleFinalSubmit = useCallback(
     async (forcedAnswers?: Record<string, CandidateAnswer>) => {
       if (isFinalizing.current) return;
@@ -496,8 +496,10 @@ function ExamSessionContent() {
           localStorage.removeItem(`cbt_session_${examId}_${userId}`);
         } catch (_) {}
 
-        // 3. Update submissions table for result and admin analytics
+        // 3. Update or Insert into submissions table for admin dashboard tracking
         const updatePayload: Record<string, any> = {
+          user_id: userId,
+          exam_id: examId,
           status: "completed",
           end_time: new Date().toISOString(),
           total_score: calculatedScore,
@@ -508,9 +510,7 @@ function ExamSessionContent() {
 
         let { error: subUpdateError } = await supabase
           .from("submissions")
-          .update(updatePayload)
-          .eq("user_id", userId)
-          .eq("exam_id", examId);
+          .upsert(updatePayload, { onConflict: "user_id,exam_id" });
 
         if (
           subUpdateError &&
@@ -524,9 +524,7 @@ function ExamSessionContent() {
           const { question_telemetry, subject_breakdown, ...fallbackPayload } = updatePayload;
           await supabase
             .from("submissions")
-            .update(fallbackPayload)
-            .eq("user_id", userId)
-            .eq("exam_id", examId);
+            .upsert(fallbackPayload, { onConflict: "user_id,exam_id" });
         }
 
         try {
