@@ -46,7 +46,6 @@ function ExamResultContent() {
   const [userEmail, setUserEmail] = useState<string>("Candidate");
   const [loading, setLoading] = useState(true);
 
-  // Toggle for question review solutions
   const [showQuestionReview, setShowQuestionReview] = useState(false);
   const [filterSubject, setFilterSubject] = useState<"all" | Subject>("all");
 
@@ -77,11 +76,11 @@ function ExamResultContent() {
 
         if (!ignore && examData) setExam(examData);
 
-        // Fetch Questions
+        // Fetch Questions (Fixed from test_id to exam_id)
         const { data: qData } = await supabase
           .from("questions")
           .select("*")
-          .eq('test_id', examId)
+          .eq("exam_id", examId)
           .order("created_at", { ascending: true });
 
         if (!ignore && qData) setQuestions(qData);
@@ -89,7 +88,6 @@ function ExamResultContent() {
         // BULLETPROOF TRIPLE-REDUNDANCY SUBMISSION FETCH
         let subData: any = null;
 
-        // 1. Try Supabase submissions table (supports both student_id/user_id and test_id/exam_id)
         const { data: sData } = await supabase
           .from("submissions")
           .select("*")
@@ -103,25 +101,23 @@ function ExamResultContent() {
           subData = sData;
         }
 
-        // 2. Try Supabase test_sessions table if submissions is empty
         if (!subData || !subData.answers) {
           const { data: sessData } = await supabase
             .from("test_sessions")
             .select("*")
-            .eq('user_id', user.id)
-            .eq('exam_id', examId)
+            .eq("user_id", user.id)
+            .eq("exam_id", examId)
             .maybeSingle();
             
           if (sessData) {
             subData = {
               ...(subData || {}),
               answers: sessData.answers,
-              status: 'completed'
+              status: "completed",
             };
           }
         }
 
-        // 3. Ultimate Fallback: Browser localStorage cache
         if ((!subData || !subData.answers || Object.keys(subData.answers).length === 0) && typeof window !== "undefined") {
           try {
             const cached = localStorage.getItem(`cbt_result_${examId}_${user.id}`);
@@ -133,7 +129,7 @@ function ExamResultContent() {
                 const parsed = JSON.parse(sessCached);
                 subData = {
                   answers: parsed.answers,
-                  status: 'completed'
+                  status: "completed",
                 };
               }
             }
@@ -156,7 +152,6 @@ function ExamResultContent() {
     };
   }, [examId, router, supabase]);
 
-  // Analytics Calculation
   const { subjectStats, totalCorrect, totalIncorrect, totalAttempted, calculatedScore, accuracy } =
     useMemo(() => {
       const answers = (submission?.answers ?? {}) as Record<string, CandidateAnswer>;
@@ -256,7 +251,6 @@ function ExamResultContent() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between">
-      {/* Official Top Bar */}
       <header className="border-b border-slate-800 bg-slate-900/90 sticky top-0 z-40 backdrop-blur-md px-6 py-3.5">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -295,9 +289,7 @@ function ExamResultContent() {
         </div>
       </header>
 
-      {/* Main Scorecard View */}
       <main className="flex-1 max-w-5xl w-full mx-auto p-4 sm:p-8 space-y-8 my-4">
-        {/* Exam Title & Candidate Info Card */}
         <div className="p-6 sm:p-8 rounded-2xl bg-gradient-to-r from-blue-900/30 via-indigo-900/20 to-slate-900 border border-slate-800 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 border-b border-slate-800/80 pb-4">
             <div>
@@ -308,7 +300,6 @@ function ExamResultContent() {
               <div className="text-xs text-slate-400 mt-1 font-mono">Candidate: {userEmail}</div>
             </div>
 
-            {/* Score Highlight Badge */}
             <div className="flex items-baseline gap-2 p-4 rounded-2xl bg-slate-950 border border-slate-800 shrink-0 text-center sm:text-right">
               <div>
                 <div className="text-[11px] uppercase font-bold tracking-wider text-slate-400">
@@ -340,9 +331,7 @@ function ExamResultContent() {
           </div>
         </div>
 
-        {/* 4 Summary Metric Cards */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-          {/* Accuracy */}
           <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
               <span>Accuracy</span>
@@ -352,7 +341,6 @@ function ExamResultContent() {
             <div className="text-[11px] text-slate-500">Correct / Attempted</div>
           </div>
 
-          {/* Attempted */}
           <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
               <span>Attempted</span>
@@ -365,7 +353,6 @@ function ExamResultContent() {
             <div className="text-[11px] text-slate-500">Questions Answered</div>
           </div>
 
-          {/* Correct */}
           <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
               <span>Correct</span>
@@ -375,7 +362,6 @@ function ExamResultContent() {
             <div className="text-[11px] text-slate-500">Right Responses</div>
           </div>
 
-          {/* Incorrect */}
           <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-1">
             <div className="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
               <span>Incorrect</span>
@@ -386,7 +372,6 @@ function ExamResultContent() {
           </div>
         </div>
 
-        {/* Subject-Wise Performance Table */}
         <div className="p-6 rounded-2xl bg-slate-900 border border-slate-800 space-y-4">
           <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
             <Award className="w-4 h-4 text-amber-400" />
@@ -453,7 +438,6 @@ function ExamResultContent() {
           </div>
         </div>
 
-        {/* Question Solutions & Review Collapsible Section */}
         <div className="p-6 rounded-2xl bg-slate-900 border border-slate-800 space-y-5">
           <div className="flex items-center justify-between">
             <div>
@@ -477,7 +461,6 @@ function ExamResultContent() {
 
           {showQuestionReview && (
             <div className="space-y-6 pt-2 border-t border-slate-800/80">
-              {/* Filter Tabs */}
               <div className="flex items-center gap-2 overflow-x-auto pb-1">
                 {(["all", "physics", "chemistry", "mathematics"] as const).map((tab) => (
                   <button
@@ -494,7 +477,6 @@ function ExamResultContent() {
                 ))}
               </div>
 
-              {/* Questions List */}
               <div className="space-y-4">
                 {filteredReviewQuestions.map((q, idx) => {
                   const candidateResp = submission?.answers?.[q.id];
@@ -522,7 +504,6 @@ function ExamResultContent() {
                           : "bg-red-500/5 border-red-500/30"
                       }`}
                     >
-                      {/* Header */}
                       <div className="flex items-center justify-between text-xs">
                         <div className="flex items-center gap-2">
                           <span className="font-bold text-white bg-slate-900 px-2.5 py-0.5 rounded border border-slate-800">
@@ -553,7 +534,6 @@ function ExamResultContent() {
                         </div>
                       </div>
 
-                      {/* Question Text */}
                       <div className="text-sm text-slate-200 leading-relaxed font-normal space-y-2">
                         <MathView math={q.question_text} />
                         {q.image_url && (
@@ -567,7 +547,6 @@ function ExamResultContent() {
                         )}
                       </div>
 
-                      {/* MCQ Options Display */}
                       {q.type === "mcq" && q.options && (
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1 text-xs">
                           {(["A", "B", "C", "D"] as const).map((optKey, optIdx) => {
@@ -602,7 +581,6 @@ function ExamResultContent() {
                         </div>
                       )}
 
-                      {/* Numerical Answer Review */}
                       {q.type === "numerical" && (
                         <div className="flex items-center gap-4 text-xs font-mono pt-1">
                           <div>
@@ -620,7 +598,6 @@ function ExamResultContent() {
                         </div>
                       )}
 
-                      {/* Solution / Explanation */}
                       {q.explanation && (
                         <div className="pt-2 border-t border-slate-800/60 text-xs text-slate-400 space-y-1">
                           <span className="font-semibold text-slate-300">Detailed Solution:</span>
@@ -637,7 +614,6 @@ function ExamResultContent() {
           )}
         </div>
 
-        {/* Footer Navigation Actions */}
         <div className="flex flex-wrap items-center justify-center gap-4 pt-4">
           <Link
             href="/test"
@@ -657,7 +633,6 @@ function ExamResultContent() {
         </div>
       </main>
 
-      {/* Footer */}
       <footer className="border-t border-slate-900 bg-slate-950 py-4 px-6 text-center text-xs text-slate-500">
         © 2026 National Testing Agency / JEE (Main). CBT Simulated Terminal Scorecard.
       </footer>
