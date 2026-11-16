@@ -642,7 +642,7 @@ function ExamSessionContent() {
             }
           }
 
-          // 2. Check public.submissions for already completed exam
+// 2. Check public.submissions for already completed exam
           const { data: subData } = await supabase
             .from("submissions")
             .select("*")
@@ -676,7 +676,6 @@ function ExamSessionContent() {
                 : 180 * 60;
 
             if (savedSecs <= 0) {
-              console.log("Timer expired in saved session. Auto-submitting...");
               const finalAns =
                 sessionData.answers && typeof sessionData.answers === "object"
                   ? (sessionData.answers as Record<string, CandidateAnswer>)
@@ -685,11 +684,9 @@ function ExamSessionContent() {
               return;
             }
 
-            // Hydrate remaining timer
             setSecondsRemaining(savedSecs);
             secondsRemainingRef.current = savedSecs;
 
-            // Hydrate candidate answers, marked_for_review, and visited
             let hydratedAnswers: Record<string, CandidateAnswer> = {};
             if (sessionData.answers && typeof sessionData.answers === "object") {
               hydratedAnswers = { ...sessionData.answers };
@@ -726,29 +723,30 @@ function ExamSessionContent() {
             setCandidateAnswers(hydratedAnswers);
             candidateAnswersRef.current = hydratedAnswers;
           } else if (subData) {
-            // Fallback to submissions record if test_sessions row wasn't present
             if (subData.answers && typeof subData.answers === "object") {
               setCandidateAnswers(subData.answers as Record<string, CandidateAnswer>);
               candidateAnswersRef.current = subData.answers as Record<string, CandidateAnswer>;
             }
 
-            if (subData.start_time && examData) {
-              const elapsedSeconds = Math.floor(
-                (new Date().getTime() - new Date(subData.start_time).getTime()) / 1000
-              );
-              const remaining = Math.max(0, examData.duration_minutes * 60 - elapsedSeconds);
-              setSecondsRemaining(remaining);
-              secondsRemainingRef.current = remaining;
-
-              if (remaining <= 0) {
-                await handleFinalSubmitRef.current(
-                  (subData.answers as Record<string, CandidateAnswer>) || {}
-                );
-                return;
-              }
+            // Fresh start timer calculation
+            const nowTime = new Date().getTime();
+            let startTimestamp = subData.start_time ? new Date(subData.start_time).getTime() : 0;
+            
+            if (!startTimestamp || (nowTime - startTimestamp) > (examData.duration_minutes * 60 * 1000)) {
+              await supabase
+                .from("submissions")
+                .update({ start_time: new Date().toISOString() })
+                .eq("user_id", user.id)
+                .eq("exam_id", examId);
+              
+              startTimestamp = nowTime;
             }
-          }
-        }
+
+            const elapsedSeconds = Math.floor((nowTime - startTimestamp) / 1000);
+            const remaining = Math.max(0, examData.duration_minutes * 60 - elapsedSeconds);
+            setSecondsRemaining(remaining);
+            secondsRemainingRef.current = remaining;
+          } 
       } catch (err) {
         console.error("Session init error:", err);
       } finally {
